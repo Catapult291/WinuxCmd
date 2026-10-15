@@ -4,6 +4,28 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Changed
+
+- **wpm**: shim payload resolution checks shallow per-package locations
+  (`<pkg>/<cmd>.exe`, plus `bin/`, `libexec/`, `lib/`, `sbin/`, `usr/bin/` at
+  depth 1-3, shallowest wins) before falling back to the bounded recursive
+  scan, so command-differs-from-package shims (`git` -> `niugit`, `cargo` ->
+  `rust`, `clang` -> `llvm`, `nu` -> `nushell`, `nvim` -> `neovim`) no longer
+  pay a whole-`opt/` tree walk on every invocation (~15k files). `time git`
+  through the shim 212 ms -> 77 ms; a prompt-style git hook batch
+  847 ms -> 291 ms; direct-hit shims (`python`, `curl`, `node`) are unchanged
+  (unixwin/niu-git#8).
+
+### Fixed
+
+- **ls**: `/` (also spelled `//`, `///`) resolves to the shell root named by
+  `__RUBASH_SHELL_ROOT`/`NIU_ROOT`/`WINUXSH_ROOT`/`RUBASH_ROOT` instead of
+  enumerating the drive root, independently of the current directory;
+  recursive listings keep the logical `/...` headers while lookups and entry
+  metadata go through the shell root (unixwin/niubash#346).
+
 ## [1.1.7] - 
 
 ### Added
