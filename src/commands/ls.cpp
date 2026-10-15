@@ -2907,10 +2907,12 @@ auto is_dangling_dereference(const EntryInfo &entry,
  * @return Result with success status
  */
 auto list_directory(const std::string &path,
-                    const CommandContext<LS_OPTIONS.size()> &ctx)
+                    const CommandContext<LS_OPTIONS.size()> &ctx,
+                    const std::wstring &lookup_override = {})
     -> cp::Result<bool> {
   std::wstring wpath = utf8_to_wstring(path);
-  const std::wstring lookup_wpath = normalize_lookup_path(wpath);
+  const std::wstring lookup_wpath =
+      normalize_lookup_path(lookup_override.empty() ? wpath : lookup_override);
   const auto lookup_operand =
       native_path::make_api_path_operand_w(lookup_wpath);
 
@@ -2938,7 +2940,7 @@ auto list_directory(const std::string &path,
   // with "\\*" produces "/\*", which GetFullPathNameW mis-parses as the
   // garbage UNC form "\\*" — `ls /` failed exactly this way (#1145).
   std::wstring search_path =
-      native_path::join_w(lookup_wpath, L"*");
+      native_path::join_w(lookup_operand.normalized, L"*");
   search_path = native_path::make_api_path_operand_w(search_path).extended;
   const std::wstring ignore_pattern = get_ignore_pattern(ctx);
   const std::wstring hide_pattern = get_hide_pattern(ctx);
@@ -2972,7 +2974,9 @@ auto list_directory(const std::string &path,
                            hide_pattern)) {
       continue;
     }
-    entries.push_back({filename, wpath + L"\\" + filename, find_data, false});
+    entries.push_back({filename,
+                       native_path::join_w(lookup_operand.normalized, filename),
+                       find_data, false});
   } while (FindNextFileW(hFind, &find_data) != 0);
 
   FindClose(hFind);
@@ -3550,7 +3554,8 @@ auto list_file(const std::string &path,
 auto list_directory_recursive(const std::string &path,
                               const CommandContext<LS_OPTIONS.size()> &ctx,
                               bool print_current_header,
-                              std::set<std::string> &visited)
+                              std::set<std::string> &visited,
+                              const std::wstring &lookup_override = {})
     -> cp::Result<bool> {
   // Check for symlink loops - normalize path for consistent comparison
   std::string normalized_path = make_generic_display_path(path);
@@ -3570,15 +3575,18 @@ auto list_directory_recursive(const std::string &path,
   }
 
   // List current directory
-  auto result = list_directory(path, ctx);
+  auto result = list_directory(path, ctx, lookup_override);
   if (!result) {
     return result;
   }
 
   // Collect subdirectories for recursion
   std::wstring wpath = utf8_to_wstring(path);
+  const auto lookup_operand = native_path::make_api_path_operand_w(
+      normalize_lookup_path(lookup_override.empty() ? wpath : lookup_override));
   // join_w for the same root-operand reason as list_directory (#1145).
-  std::wstring search_path = native_path::join_w(wpath, L"*");
+  std::wstring search_path =
+      native_path::join_w(lookup_operand.normalized, L"*");
   search_path = native_path::make_api_path_operand_w(search_path).extended;
 
   WIN32_FIND_DATAW find_data;
@@ -3588,7 +3596,7 @@ auto list_directory_recursive(const std::string &path,
     return true;  // No entries
   }
 
-  std::vector<std::string> subdirs;
+  std::vector<std::pair<std::string, std::wstring>> subdirs;
   const std::wstring ignore_pattern = get_ignore_pattern(ctx);
   const std::wstring hide_pattern = get_hide_pattern(ctx);
   const bool follow_directory_symlinks =
@@ -3614,23 +3622,25 @@ auto list_directory_recursive(const std::string &path,
       continue;
     }
 
-    std::wstring full_path = wpath + L"\\" + filename;
+    std::wstring full_path = native_path::join_w(wpath, filename);
     std::string subdir_path =
         make_generic_display_path(wstring_to_utf8(full_path));
     // Skip if already visited (symlink loop detection)
     if (visited.count(subdir_path) > 0) {
       continue;
     }
-    subdirs.push_back(subdir_path);
+    subdirs.emplace_back(
+        subdir_path, native_path::join_w(lookup_operand.normalized, filename));
   } while (FindNextFileW(hFind, &find_data) != 0);
 
   FindClose(hFind);
 
   // Recursively list subdirectories.  GNU ls separates each directory
   // section with a blank line before the next header.
-  for (const auto &subdir : subdirs) {
+  for (const auto &[subdir, lookup_subdir] : subdirs) {
     safePrintLn(L"");
-    auto subdir_result = list_directory_recursive(subdir, ctx, true, visited);
+    auto subdir_result =
+        list_directory_recursive(subdir, ctx, true, visited, lookup_subdir);
     if (!subdir_result) {
       return subdir_result;
     }

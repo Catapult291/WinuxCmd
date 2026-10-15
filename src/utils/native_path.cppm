@@ -102,6 +102,25 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
   const bool had_trailing_separator =
       strip_trailing_separators(path).size() != path.size();
   std::wstring normalized(strip_trailing_separators(path));
+  if (!normalized.empty() &&
+      normalized.find_first_not_of(L'/') == std::wstring::npos) {
+    normalized = L"/";
+  }
+  if (normalized == L"/") {
+    for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                             L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+      const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+      if (needed == 0) continue;
+      std::wstring root(needed, L'\0');
+      const DWORD written = GetEnvironmentVariableW(name, root.data(), needed);
+      if (written == 0 || written >= needed) continue;
+      root.resize(written);
+      normalized = root.find_first_not_of(L'/') == std::wstring::npos
+                       ? L"\\"
+                       : normalize_api_operand_w(root);
+      break;
+    }
+  }
   // Cygwin drive prefix: /cygdrive/d/... names the same file as /d/... and
   // D:\... (the GNU runtime layer resolves every spelling; cygpath/mktemp
   // additionally recognize the prefix in raw argument text). Folding it to
@@ -125,9 +144,8 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
     }
     const size_t drive_pos = k_cygdrive_name.size() + 2;
     const wchar_t drive_ch = normalized[drive_pos];
-    const bool drive_letter =
-        (drive_ch >= L'a' && drive_ch <= L'z') ||
-        (drive_ch >= L'A' && drive_ch <= L'Z');
+    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
+                              (drive_ch >= L'A' && drive_ch <= L'Z');
     if (name_match && is_separator(normalized[1 + k_cygdrive_name.size()]) &&
         drive_letter &&
         (normalized.size() == drive_pos + 1 ||

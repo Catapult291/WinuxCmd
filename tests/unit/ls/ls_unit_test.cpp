@@ -101,6 +101,103 @@ TEST(ls, ls_basic) {
   EXPECT_TRUE(r.stdout_text.find("file2.txt") != std::string::npos);
 }
 
+TEST(ls, shell_root_is_independent_of_cwd) {
+  TempDir root;
+  TempDir cwd;
+  root.write("root-marker.txt", "root");
+  cwd.write("cwd-marker.txt", "cwd");
+  for (const auto* variable :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    for (const auto* spelling : {L"/", L"//", L"///"}) {
+      Pipeline pipeline;
+      pipeline.set_cwd(cwd.wpath());
+      for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                               L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+        pipeline.set_env(name, L"");
+      }
+      pipeline.set_env(variable, root.wpath());
+      pipeline.add(L"ls.exe", {L"-1", spelling});
+      const auto result = pipeline.run();
+      EXPECT_EQ(result.exit_code, 0);
+      EXPECT_EQ_TEXT(result.stdout_text, "root-marker.txt\n");
+      EXPECT_EQ_TEXT(result.stderr_text, "");
+    }
+  }
+}
+
+TEST(ls, shell_root_canonical_selection_precedes_niu_and_legacy) {
+  TempDir canonical;
+  TempDir primary;
+  TempDir legacy;
+  canonical.write("canonical.txt", "canonical");
+  primary.write("primary.txt", "primary");
+  legacy.write("legacy.txt", "legacy");
+  for (const bool use_canonical : {true, false}) {
+    Pipeline pipeline;
+    pipeline.set_cwd(legacy.wpath());
+    pipeline.set_env(L"__RUBASH_SHELL_ROOT",
+                     use_canonical ? canonical.wpath() : L"");
+    pipeline.set_env(L"NIU_ROOT", primary.wpath());
+    pipeline.set_env(L"WINUXSH_ROOT", legacy.wpath());
+    pipeline.set_env(L"RUBASH_ROOT", legacy.wpath());
+    pipeline.add(L"ls.exe", {L"-1", L"/"});
+    const auto result = pipeline.run();
+    EXPECT_EQ(result.exit_code, 0);
+    EXPECT_EQ_TEXT(result.stdout_text,
+                   use_canonical ? "canonical.txt\n" : "primary.txt\n");
+    EXPECT_EQ_TEXT(result.stderr_text, "");
+  }
+}
+
+TEST(ls, shell_root_niu_root_names_layout_root_not_usr_or_bin) {
+  TempDir root;
+  TempDir cwd;
+  root.write("etc/root-contract.txt", "root");
+  root.write("usr/bin/tool.txt", "tool");
+  Pipeline pipeline;
+  pipeline.set_cwd(cwd.wpath());
+  pipeline.set_env(L"__RUBASH_SHELL_ROOT", L"");
+  pipeline.set_env(L"NIU_ROOT", root.wpath());
+  pipeline.set_env(L"WINUXSH_ROOT", cwd.wpath());
+  pipeline.set_env(L"RUBASH_ROOT", cwd.wpath());
+  pipeline.add(L"ls.exe", {L"-1R", L"/"});
+  const auto result = pipeline.run();
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_EQ_TEXT(result.stdout_text,
+                 "/:\netc\nusr\n\n/etc:\nroot-contract.txt\n\n/usr:\nbin\n"
+                 "\n/usr/bin:\ntool.txt\n");
+  EXPECT_EQ_TEXT(result.stderr_text, "");
+}
+
+TEST(ls, shell_root_recursive_lookup_keeps_logical_headers) {
+  TempDir root;
+  TempDir cwd;
+  root.write("nested/child.txt", "child");
+  Pipeline pipeline;
+  pipeline.set_cwd(cwd.wpath());
+  pipeline.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+  pipeline.add(L"ls.exe", {L"-1R", L"/"});
+  const auto result = pipeline.run();
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_EQ_TEXT(result.stdout_text, "/:\nnested\n\n/nested:\nchild.txt\n");
+  EXPECT_EQ_TEXT(result.stderr_text, "");
+}
+
+TEST(ls, shell_root_long_listing_uses_root_entry_metadata) {
+  TempDir root;
+  TempDir cwd;
+  root.write("root-marker.txt", "root");
+  Pipeline pipeline;
+  pipeline.set_cwd(cwd.wpath());
+  pipeline.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+  pipeline.add(L"ls.exe", {L"-ln", L"/"});
+  const auto result = pipeline.run();
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_TRUE(result.stdout_text.find("root-marker.txt") != std::string::npos);
+  EXPECT_TRUE(result.stdout_text.find('?') == std::string::npos);
+  EXPECT_EQ_TEXT(result.stderr_text, "");
+}
+
 TEST(ls, ls_hide_pattern_hides_matching_entries_in_default_mode) {
   TempDir tmp;
   tmp.write("a.txt", "a");
@@ -3178,16 +3275,16 @@ namespace {
 auto ls_slash_drive_form(const std::filesystem::path& path) -> std::wstring {
   std::wstring text = path.generic_wstring();
   std::wstring drive = text.substr(0, 1);
-  drive[0] = static_cast<wchar_t>(
-      std::tolower(static_cast<unsigned char>(drive[0])));
+  drive[0] =
+      static_cast<wchar_t>(std::tolower(static_cast<unsigned char>(drive[0])));
   return L"/" + drive + text.substr(2);
 }
 
 auto ls_cygdrive_form(const std::filesystem::path& path) -> std::wstring {
   std::wstring text = path.generic_wstring();
   std::wstring drive = text.substr(0, 1);
-  drive[0] = static_cast<wchar_t>(
-      std::tolower(static_cast<unsigned char>(drive[0])));
+  drive[0] =
+      static_cast<wchar_t>(std::tolower(static_cast<unsigned char>(drive[0])));
   return L"/cygdrive/" + drive + text.substr(2);
 }
 
