@@ -91,40 +91,86 @@ static std::optional<int> forwardToOptPayload(std::string_view name) noexcept {
   if (!fs::is_regular_file(payload, ec)) {
     // Package dir may differ from the command name (e.g.
     // opt\sysinternals-suite\ provides accesschk.exe), and toolchain payloads
-    // may nest their exes (e.g. opt\go\bin\go.exe): scan each package
-    // directory, shallowest match wins, up to a small depth bound.
+    // may nest their exes (e.g. opt\go\bin\go.exe): resolve the payload from
+    // each package's shallow, well-known locations first (breadth-first,
+    // shallowest match wins), and only fall back to a bounded recursive scan
+    // for exotic nested layouts.
+    //
+    // PERF (issue niu-git#8): the previous whole-tree recursive_directory_iterator
+    // over <root>\opt\ walked every file looking for a shallow <name>.exe.
+    // When the command name differs from the package name (git -> opt\niugit\)
+    // that scan traversed ~15k files on every invocation (~170ms) before a
+    // match, which dominated `git` startup (220ms vs 56ms direct). Checking
+    // the few well-known shallow locations makes this O(#packages) and
+    // restores near-native forwarding speed for every shim package.
     const fs::path opt_dir = root / L"opt";
     if (!fs::exists(opt_dir, ec)) return std::nullopt;
+    const std::wstring wanted = utf8_to_wstring(std::string(name)) + L".exe";
     bool found = false;
     size_t best_depth = SIZE_MAX;
 
-    const std::wstring wanted = utf8_to_wstring(std::string(name)) + L".exe";
-    auto iequals_wanted = [&wanted](const std::wstring& candidate) {
-      if (candidate.size() != wanted.size()) return false;
-      for (size_t i = 0; i < candidate.size(); ++i) {
-        wchar_t a = candidate[i], b = wanted[i];
-        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
-        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
-        if (a != b) return false;
-      }
-      return true;
+    // Shallow payload locations per package, ascending by depth. Depth is
+    // relative to <root>\opt\ (same scale the old iterator used): a package
+    // root exe is depth 1, <pkg>\bin\<exe> depth 2, etc.
+    struct PayloadLocation {
+      std::wstring_view subdir;
+      size_t depth;
     };
-
-    fs::recursive_directory_iterator it(
-        opt_dir, fs::directory_options::skip_permission_denied, ec);
-    for (; it != fs::end(it); it.increment(ec)) {
+    static constexpr PayloadLocation kPayloadLocations[] = {
+        {L"", 1}, {L"bin", 2}, {L"libexec", 2}, {L"lib", 2},
+        {L"sbin", 2}, {L"usr\\bin", 3}};
+    for (fs::directory_iterator pkg_it(opt_dir, ec);
+         pkg_it != fs::directory_iterator(); pkg_it.increment(ec)) {
       if (ec) break;
-      const size_t depth = static_cast<size_t>(it.depth());
-      if (depth > 3 || depth >= best_depth) continue;
-      std::error_code file_ec;
-      if (!it->is_regular_file(file_ec)) continue;
-      if (!iequals_wanted(it->path().filename().wstring())) continue;
-      payload = it->path();
-      found = true;
-      best_depth = depth;
-      if (best_depth == 0) break;
+      if (!pkg_it->is_directory(ec)) continue;
+      const fs::path pkg = pkg_it->path();
+      for (const auto& loc : kPayloadLocations) {
+        fs::path cand = pkg;
+        if (!loc.subdir.empty()) cand /= loc.subdir;
+        cand /= wanted;
+        std::error_code file_ec;
+        if (fs::is_regular_file(cand, file_ec) && !file_ec) {
+          if (loc.depth < best_depth) {
+            payload = cand;
+            best_depth = loc.depth;
+            found = true;
+          }
+        }
+      }
+      // A depth-1 (package root) match is globally shallowest: stop early
+      // rather than walking the remaining packages.
+      if (found && best_depth == 1) break;
     }
-    if (!found) return std::nullopt;
+
+    if (!found) {
+      // Fallback for exotic nested layouts: bounded recursive scan,
+      // shallowest match wins, up to the small depth bound.
+      auto iequals_wanted = [&wanted](const std::wstring& candidate) {
+        if (candidate.size() != wanted.size()) return false;
+        for (size_t i = 0; i < candidate.size(); ++i) {
+          wchar_t a = candidate[i], b = wanted[i];
+          if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+          if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+          if (a != b) return false;
+        }
+        return true;
+      };
+      fs::recursive_directory_iterator it(
+          opt_dir, fs::directory_options::skip_permission_denied, ec);
+      for (; it != fs::end(it); it.increment(ec)) {
+        if (ec) break;
+        const size_t depth = static_cast<size_t>(it.depth());
+        if (depth > 3 || depth >= best_depth) continue;
+        std::error_code file_ec;
+        if (!it->is_regular_file(file_ec)) continue;
+        if (!iequals_wanted(it->path().filename().wstring())) continue;
+        payload = it->path();
+        found = true;
+        best_depth = depth;
+        if (best_depth == 0) break;
+      }
+      if (!found) return std::nullopt;
+    }
   }
 
   // Rebuild the child command line from the raw one so the original quoting
