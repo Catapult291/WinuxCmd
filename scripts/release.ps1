@@ -230,7 +230,11 @@ if ($PullRequestFlow) {
     # is retried and its exit code is enforced.
     $fetchOk = $false
     for ($attempt = 1; $attempt -le 3; $attempt++) {
-        git fetch origin $BaseBranch --tags
+        # The branch first, tags separately: `--tags` fails the whole fetch when
+        # a local tag disagrees with the remote (v1.0.4 did, and that aborted a
+        # release after its PR had already been merged), while the branch ref
+        # itself is still updated. Tag hygiene must not block a release.
+        git fetch origin $BaseBranch
         if ($LASTEXITCODE -eq 0) {
             $fetchOk = $true
             break
@@ -241,6 +245,10 @@ if ($PullRequestFlow) {
     if (-not $fetchOk) {
         Write-Color "Red" "Failed to fetch origin/$BaseBranch; refusing to tag a stale commit"
         exit 1
+    }
+    git fetch origin --tags --force 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Color "Yellow" "  note: fetching tags reported conflicts; the branch ref above is what gets tagged"
     }
 
     # The PR merge must be visible in the fetched ref before tagging it.
