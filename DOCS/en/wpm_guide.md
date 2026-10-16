@@ -54,9 +54,9 @@ WPM expects the following directory structure under the WinuxCmd root:
 
 ```
 <root>/
-├── bin/            # Legacy command links
+├── bin/            # PATH entry links (hardlink per package command)
 ├── usr/
-│   ├── bin/        # Canonical command links (hardlinks / symlinks)
+│   ├── bin/        # Installed packages (flat) and shim dispatchers
 │   └── local/
 │       └── bin/    # Additional user links
 ├── etc/            # Configuration
@@ -124,6 +124,8 @@ wpm install gzip --dry-run        # Preview changes without writing
 - If the package is already installed and all destination files exist, WPM reports `"already installed"` and skips unless `--force` is used.
 - For `layout=shim` packages, the actual payload goes to `<root>/opt/<pkg>/` and command shims (hardlinks of `winuxcmd.exe`) are created in `usr/bin/`.
 - For `layout=flat` (default) packages, files are placed directly into `usr/bin/`.
+- Every command a package declares also gets `<root>/bin/<command>.exe` as a **hardlink to the real binary** — the payload under `opt/<pkg>/` for shim packages, the mapped binary in `usr/bin/` for flat ones. It is the same file, not a copy and not a forwarding process, so the entry costs no startup time. The links are recorded in the package receipt and stay in sync through install, update, `wpm links rebuild` and uninstall.
+- WPM checks every destination **before writing anything**. A file held open by a running program cannot be replaced on Windows at all, so the install refuses up front and leaves the package exactly as it was, listing the files and the programs running from them (`wpm: N file(s) are in use and cannot be replaced …`). Close those programs and retry. This is why an upgrade never leaves a half-updated package behind.
 - Downloads use a SHA-256 verified cache. Repeated installs skip the download if the cached artifact is valid.
 
 ### 4.2 `wpm uninstall | remove | erase <package>...`
@@ -477,6 +479,10 @@ WPM automatically detects the CPU architecture:
 | `flat` (default) | Files are placed directly into `usr/bin/`. |
 | `shim` | Payload goes to `<root>/opt/<pkg>/`; command shims (hardlinks of `winuxcmd.exe`) are created in `usr/bin/`. The dispatcher routes to the actual payload. |
 
+Choose `shim` whenever the payload carries its own DLLs (OpenSSH's `libcrypto.dll`) or ships several files: it keeps everything out of `usr/bin/`, which sits on `%PATH%`. Choose `flat` when the binary itself is what users and tools should resolve.
+
+Whichever layout an artifact uses, `<root>/bin/<command>.exe` is created as a hardlink to the real binary (see [`wpm install`](#41-wpm-install-package)).
+
 ### SHA-256 Verification
 
 Every artifact **must** have a `sha256` field. WPM refuses to install remote artifacts without a checksum. After downloading, the checksum is verified before extraction.
@@ -496,6 +502,8 @@ The `files` array maps source paths (inside the archive or binary) to destinatio
 - Directory mappings are supported: if `from` ends with `/` or `kind` is `"dir"`, the entire directory is copied.
 - Flat-layout destinations are resolved relative to `usr/bin/`.
 - Shim-layout destinations are resolved relative to `<root>/opt/<pkg>/`.
+- A file mapping that duplicates a path already covered by a directory mapping does **not** copy the file twice: both destinations are hardlinks to the same payload file, so the package occupies one copy on disk. (The fake second copy used to come from the extraction directory, which also left the manifest's payload unreferenced.)
+- `sha256` and `size` in the index must describe the published artifact exactly, and every `from` path must exist inside it — a mapping for a file the artifact no longer ships fails the install with "extracted path not found".
 
 ---
 
@@ -663,11 +671,11 @@ Add a new object to the `packages` array in `index.json`:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | Yes | Unique package name (lowercase, alphanumeric + hyphens). |
-| `version` | string | Yes | Semantic version string. |
+| `version` | string | Yes | Version string, compared as dotted numbers. A **repackaged** artifact must add a packaging revision (`2.56.0.1-unixwin2`, `5.4.1-unixwin1`) or installed copies are compared as the same version and never offered the update. Publishers that are not PyPI-style (`9.5.0.0p1`, `r42`) still order sensibly. |
 | `kind` | string | Yes | Package kind: `exe` for executables. |
 | `category` | string | Yes | One of the established categories or a new one. |
 | `license` | string | Yes | SPDX license identifier. |
-| `commands` | string[] | Yes | Command names that become available after install. |
+| `commands` | string[] | Yes | Command names that become available after install — in `usr/bin/` and as PATH entry links in `<root>/bin/`. |
 | `description` | string | Yes | One-line description. |
 | `homepage` | string | Yes | Project homepage URL. |
 | `artifacts` | object | Yes | Map of architecture key to artifact definition. |

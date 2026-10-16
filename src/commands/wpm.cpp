@@ -5,6 +5,7 @@
 /// @License: MIT
 
 #include <bcrypt.h>
+#include <tlhelp32.h>
 #include <urlmon.h>
 #include <winhttp.h>
 
@@ -1958,10 +1959,21 @@ auto copy_directory_contents(const fs::path& src, const fs::path& dest,
     }
     if (!entry.is_regular_file(ec)) continue;
     fs::create_directories(target.parent_path(), ec);
-    fs::copy_file(
-        entry.path(), target,
-        force ? fs::copy_options::overwrite_existing : fs::copy_options::none,
-        ec);
+    if (force) {
+      std::error_code exists_ec;
+      if (fs::exists(target, exists_ec) && !delete_file_name(target)) {
+        safeErrorPrintLn("wpm: failed to replace '" + target.string() + "'");
+        return false;
+      }
+      // POSIX unlink rather than an in-place overwrite: a payload file can be
+      // held by a process from the previous version (git's fsmonitor daemon
+      // holds libexec/git-core/git.exe while any monitored repository keeps it
+      // alive), and an overwrite then fails with a sharing violation and
+      // aborts the upgrade half-applied. Unlinking the name leaves the holder
+      // on the old inode and lets the new bytes land.
+    }
+    fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing,
+                  ec);
     if (ec) {
       safeErrorPrintLn("wpm: failed to copy '" + entry.path().string() +
                        "' to '" + target.string() + "': " + ec.message());
@@ -2131,6 +2143,218 @@ auto download_artifact(const fs::path& root, const std::string& package,
   return std::nullopt;
 }
 
+/// When a file mapping's source also lives inside a directory mapping (the
+/// flat layout maps `mingw64/` *and* `mingw64/bin/git.exe`), the authoritative
+/// source is the materialized payload, not the extraction directory: linking
+/// out of staging left the PATH entry as a second copy on disk and tied it to
+/// a transient directory, while the manifest - and every documented upgrade -
+/// talks about `opt/<pkg>/...` (unixwin/WinuxCmd#1188).
+auto payload_source_for(const fs::path& extracted, const fs::path& root,
+                        const nlohmann::json& artifact,
+                        std::string_view package, const fs::path& source)
+    -> std::optional<fs::path> {
+  if (!artifact.contains("files") || !artifact["files"].is_array())
+    return std::nullopt;
+  const bool single_file_fallback = artifact.value("type", "exe") == "exe";
+  for (const auto& mapping : artifact["files"]) {
+    if (!mapping_is_directory(mapping)) continue;
+    const std::string from = mapping.value("from", "");
+    if (from.empty()) continue;
+    auto directory_source =
+        find_artifact_path(extracted, from, true, single_file_fallback);
+    if (!directory_source) continue;
+    std::error_code rel_ec;
+    const fs::path relative = fs::relative(source, *directory_source, rel_ec);
+    if (rel_ec || relative.empty() || relative.native().starts_with(L".."))
+      continue;
+    auto directory_dest =
+        artifact_destination_for_mapping(root, artifact, package, mapping);
+    if (!directory_dest) continue;
+    std::error_code exists_ec;
+    const fs::path candidate = *directory_dest / relative;
+    if (fs::exists(candidate, exists_ec)) return candidate;
+  }
+  return std::nullopt;
+}
+
+/// The PATH entry directory the host puts in front of users (`\bin`, not
+/// `\usr\bin`: that one carries hundreds of tools and must stay off PATH).
+auto entry_dir(const fs::path& root) -> fs::path { return root / "bin"; }
+
+/// Where each command of a package resolves inside its payload, paired with
+/// the entry link the host PATH needs: `<root>/bin/<cmd>` as a hardlink to the
+/// real binary - never a launcher (a link is free, a forwarding process costs
+/// ~20 ms per invocation). Declaring the links here means install, update and
+/// uninstall keep the PATH set in sync instead of leaving stale binaries
+/// behind when the payload moves on (unixwin/niubash#376 rule 5).
+auto package_entry_links(const fs::path& root, const nlohmann::json& pkg,
+                         const nlohmann::json& artifact)
+    -> std::vector<std::pair<fs::path, fs::path>> {
+  std::vector<std::pair<fs::path, fs::path>> links;
+  if (!pkg.contains("commands") || !pkg["commands"].is_array()) return links;
+  const std::string package = pkg.value("name", "");
+  if (package.empty()) return links;
+  for (const auto& item : pkg["commands"]) {
+    if (!item.is_string()) continue;
+    const std::string command = item.get<std::string>();
+    if (command.empty()) continue;
+    fs::path payload;
+    if (artifact_layout(artifact) == "shim") {
+      payload = package_payload_dir(root, package) / exe_suffix(command);
+    } else if (artifact.contains("files") && artifact["files"].is_array()) {
+      // Flat layouts map the command binary itself; that mapping's destination
+      // is the payload copy.
+      for (const auto& mapping : artifact["files"]) {
+        if (mapping_is_directory(mapping)) continue;
+        auto dest =
+            artifact_destination_for_mapping(root, artifact, package, mapping);
+        if (!dest) continue;
+        if (dest->filename() == exe_suffix(command)) {
+          payload = *dest;
+          break;
+        }
+      }
+    }
+    if (payload.empty()) continue;
+    links.emplace_back(payload, entry_dir(root) / exe_suffix(command));
+  }
+  return links;
+}
+
+/// Materialize the package's entry links (idempotent: identical content is
+/// left alone, a link that points at older bytes is rebuilt).
+auto create_package_entry_links(const fs::path& root, const nlohmann::json& pkg,
+                                const nlohmann::json& artifact, bool force,
+                                bool dry_run, bool json) -> bool {
+  auto progress = [json](std::string_view line) {
+    if (json) {
+      safeErrorPrintLn(line);
+    } else {
+      safePrintLn(line);
+    }
+  };
+  const fs::path current = current_exe_path();
+  for (const auto& [payload, link] : package_entry_links(root, pkg, artifact)) {
+    std::error_code ec;
+    if (!fs::exists(payload, ec)) continue;
+    if (same_path_name(current, link)) continue;  // never touch the running exe
+    if (same_file(payload, link)) continue;       // already the right bytes
+    if (dry_run) {
+      if (json) {
+        safeErrorPrintLn("wpm: dry-run: would link " + link.string());
+      } else {
+        progress("wpm: would link " + link.string());
+      }
+      continue;
+    }
+    if (materialize_file(payload, link, force, ec)) {
+      progress("wpm: linked " + link.string());
+      continue;
+    }
+    safeErrorPrintLn("wpm: failed to create the entry link '" + link.string() +
+                     "': " + ec.message());
+    return false;
+  }
+  return true;
+}
+
+/// Can this name be replaced at all? A file held by a running process -git's
+/// `fsmonitor--daemon` keeps `libexec/git-core/git.exe` mapped while any
+/// monitored repository lives, an editor holds `git.exe` - denies delete *and*
+/// overwrite with Access denied (measured), so an upgrade that finds out
+/// mid-copy aborts half-applied: payload directories updated, the PATH entry
+/// still on the old version. Ask first.
+auto name_is_replaceable(const fs::path& target) -> bool {
+  HANDLE handle = CreateFileW(target.wstring().c_str(), DELETE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(handle);
+  return true;
+}
+
+/// The main image of every process running from `target` (the usual holder of
+/// a payload file, and the one a user can actually close).
+auto processes_running_from(const fs::path& target) -> std::vector<std::string> {
+  std::vector<std::string> holders;
+  const auto wanted = normalized_path_key(target);  // std::wstring key
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return holders;
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Process32FirstW(snapshot, &entry)) {
+    do {
+      HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                   entry.th32ProcessID);
+      if (process == nullptr) continue;
+      WCHAR buffer[MAX_PATH * 2];
+      DWORD size = static_cast<DWORD>(std::size(buffer));
+      if (QueryFullProcessImageNameW(process, 0, buffer, &size) != 0) {
+        const fs::path image(buffer);
+        if (normalized_path_key(image) == wanted)
+          holders.push_back(image.string());
+      }
+      CloseHandle(process);
+    } while (Process32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return holders;
+}
+
+/// Destinations this artifact would have to replace but cannot, with the
+/// processes to close. Empty means the install can proceed safely.
+struct BlockedReplacement {
+  fs::path target;
+  std::vector<std::string> holders;
+};
+
+auto preflight_replacements(const fs::path& extracted, const fs::path& root,
+                            const nlohmann::json& artifact,
+                            std::string_view package)
+    -> std::vector<BlockedReplacement> {
+  std::vector<BlockedReplacement> blocked;
+  const fs::path core = canonical_winuxcmd_path(root);
+  const fs::path current = current_exe_path();
+  const bool single_file_fallback = artifact.value("type", "exe") == "exe";
+  if (!artifact.contains("files") || !artifact["files"].is_array())
+    return blocked;
+
+  auto check = [&](const fs::path& target) {
+    std::error_code exists_ec;
+    if (!fs::exists(target, exists_ec)) return;
+    if (same_file(core, target) || same_path_name(current, target)) return;
+    if (name_is_replaceable(target)) return;
+    blocked.push_back({target, processes_running_from(target)});
+  };
+
+  for (const auto& mapping : artifact["files"]) {
+    const bool directory = mapping_is_directory(mapping);
+    auto dest = artifact_destination_for_mapping(root, artifact, package, mapping);
+    if (!dest) continue;
+    if (!directory) {
+      check(*dest);
+      continue;
+    }
+    const std::string from = mapping.value("from", "");
+    auto source = find_artifact_path(extracted, from, true, single_file_fallback);
+    if (!source) continue;
+    std::error_code walk_ec;
+    for (const auto& entry : fs::recursive_directory_iterator(
+             *source, fs::directory_options::skip_permission_denied, walk_ec)) {
+      if (walk_ec) break;
+      std::error_code type_ec;
+      if (!entry.is_regular_file(type_ec)) continue;
+      std::error_code rel_ec;
+      const fs::path relative = fs::relative(entry.path(), *source, rel_ec);
+      if (rel_ec) continue;
+      check(*dest / relative);
+    }
+  }
+  return blocked;
+}
+
 auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
                          const nlohmann::json& artifact, bool force,
                          bool dry_run, std::string_view package, bool json)
@@ -2174,6 +2398,16 @@ auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
       return false;
     }
     fs::path dest = *mapped_dest;
+    // A file mapping whose source also lives inside a directory mapping must
+    // be sourced from the materialized payload (payload_source_for): taking it
+    // from the extraction directory hardlinked the PATH entry to a transient
+    // tree and left a second full copy on disk (unixwin/WinuxCmd#1188).
+    fs::path source = *src;
+    if (!directory) {
+      if (auto payload =
+              payload_source_for(extracted, root, artifact, package, *src))
+        source = *payload;
+    }
     std::error_code ec;
     bool dest_exists = fs::exists(dest, ec);
     bool dest_is_winux_link =
@@ -2191,7 +2425,7 @@ auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
       return false;
     }
     if (dest_exists && !dest_is_winux_link && !force && !directory &&
-        !same_file(*src, dest)) {
+        !same_file(source, dest)) {
       safeErrorPrintLn("wpm: destination exists; use --force: " +
                        dest.string());
       return false;
@@ -2224,10 +2458,10 @@ auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
         return false;
       }
     }
-    if (!materialize_file(*src, dest, true, ec)) {
+    if (!materialize_file(source, dest, true, ec)) {
       safeErrorPrintLn(wpm_text("command.wpm.error.materialize",
                                 "wpm: failed to install '{}' to '{}': {}",
-                                src->string(), dest.string(), ec.message()));
+                                source.string(), dest.string(), ec.message()));
       return false;
     }
   }
@@ -2336,6 +2570,12 @@ auto write_install_receipt(const fs::path& root, const nlohmann::json& pkg,
                             {"destinations", nlohmann::json::array()}};
   for (const auto& dest : *destinations) {
     receipt["destinations"].push_back(dest.string());
+  }
+  // The PATH entry links are managed destinations too, so a later reconcile or
+  // an uninstall removes them with the package.
+  for (const auto& [payload, link] : package_entry_links(root, pkg, artifact)) {
+    (void)payload;
+    receipt["destinations"].push_back(link.string());
   }
   std::error_code ec;
   fs::create_directories(receipts_dir(root), ec);
@@ -2815,6 +3055,7 @@ auto prune_stale_entries(const fs::path& installed, const fs::path& source,
 // considered, they must resolve inside the root, and the winuxcmd image and
 // the running executable are never touched.
 auto prune_superseded_install(const fs::path& root, const std::string& package,
+                              const nlohmann::json& pkg,
                               const nlohmann::json& artifact,
                               const fs::path& extracted, bool dry_run,
                               bool verbose) -> void {
@@ -2847,6 +3088,13 @@ auto prune_superseded_install(const fs::path& root, const std::string& package,
           find_artifact_path(extracted, from, directory, single_file_fallback);
       covered.push_back({*destination, source ? *source : fs::path{}, directory});
     }
+  }
+  // The entry links this artifact expects are covered destinations: without
+  // this the reconcile would treat the previous receipt's `bin/<cmd>` entries
+  // as "no longer mapped" and delete them.
+  for (const auto& [payload, link] : package_entry_links(root, pkg, artifact)) {
+    (void)payload;
+    covered.push_back({link, fs::path{}, false});
   }
 
   const bool upgraded =
@@ -3029,11 +3277,41 @@ auto install_package(const Options& opts, std::string_view package_name,
     return finish(false, "error");
   }
 
+  // Ask before touching anything: a payload file held by a running process
+  // cannot be replaced (delete and overwrite both return Access denied), and
+  // discovering that mid-copy leaves the package half-updated - directories on
+  // the new version, the PATH entry on the old one. Refusing up front keeps
+  // the installation consistent and tells the user what to close.
+  if (!opts.dry_run) {
+    const auto blocked = preflight_replacements(
+        extracted, opts.root, *artifact,
+        pkg->value("name", std::string(package_name)));
+    if (!blocked.empty()) {
+      std::string detail;
+      for (const auto& item : blocked) {
+        detail += "\n  " + item.target.string();
+        if (item.holders.empty()) {
+          detail += "\n      (held by a process that cannot be named)";
+        }
+        for (const auto& holder : item.holders)
+          detail += "\n      running: " + holder;
+      }
+      auto line = wpm_text(
+          "command.wpm.error.files_in_use",
+          "wpm: {} file(s) are in use and cannot be replaced; close the listed "
+          "programs (a running git, an editor's git integration, a fsmonitor "
+          "daemon) and retry:{}",
+          blocked.size(), detail);
+      safeErrorPrintLn(line);
+      json_errors.push_back(line);
+      return finish(false, "files_in_use");
+    }
+  }
   const bool shim_layout = artifact_layout(*artifact) == "shim";
   // Reconcile the previous install before laying the new payload down, so a
   // renamed/removed file cannot survive as an inert leftover.
   prune_superseded_install(opts.root, pkg->value("name", std::string(package_name)),
-                           *artifact, extracted, opts.dry_run, opts.verbose);
+                           *pkg, *artifact, extracted, opts.dry_run, opts.verbose);
   progress(wpm_text("command.wpm.status.installing_files",
                     "wpm: installing files..."));
   if (!copy_artifact_files(
@@ -3072,7 +3350,27 @@ auto install_package(const Options& opts, std::string_view package_name,
                       pkg->value("name", std::string(package_name))));
     return finish(true, "would_install");
   }
+  // The host PATH points at <root>/bin, not <root>/usr/bin (that directory
+  // carries hundreds of tools and stays off PATH): give every command of this
+  // package an entry link there, as a hardlink to the payload binary so the
+  // cost is zero and no launcher process is involved (unixwin/niubash#376).
+  if (!create_package_entry_links(opts.root, *pkg, *artifact, opts.force,
+                                  opts.dry_run, json)) {
+    json_errors.push_back(
+        wpm_text("command.wpm.error.entry_link_failed",
+                 "wpm: failed to create entry links for '{}'",
+                 pkg->value("name", std::string(package_name))));
+    return finish(false, "error");
+  }
   write_install_receipt(opts.root, *pkg, *artifact);
+  // The extraction directory has served its purpose and would otherwise keep a
+  // second copy of the payload - and, historically, the inode the PATH entry
+  // pointed at - alive under a directory that reads as transient.
+  std::error_code prune_ec;
+  fs::remove_all(extracted, prune_ec);
+  if (prune_ec && opts.verbose)
+    safeErrorPrintLn("wpm: note: could not prune " + extracted.string() + ": " +
+                     prune_ec.message());
   progress(wpm_text("command.wpm.status.installed", "wpm: installed {}",
                     pkg->value("name", std::string(package_name))));
   return finish(true, "installed");
@@ -4179,6 +4477,20 @@ auto uninstall_package(const Options& opts, const nlohmann::json& pkg)
     }
     if (!uninstall_remove_destination(opts, *dest, directory, removed,
                                       errors)) {
+      ok = false;
+    }
+  }
+  // Entry links live in <root>/bin on the host PATH, not under the payload, so
+  // they are derived from the package's commands rather than the file mapping.
+  for (const auto& [payload, link] : package_entry_links(opts.root, pkg,
+                                                         *artifact)) {
+    (void)payload;
+    if (opts.dry_run) {
+      std::error_code ec;
+      if (fs::exists(link, ec)) removed.push_back(link.string());
+      continue;
+    }
+    if (!uninstall_remove_destination(opts, link, false, removed, errors)) {
       ok = false;
     }
   }

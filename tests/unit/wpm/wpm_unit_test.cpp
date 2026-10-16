@@ -1598,9 +1598,15 @@ TEST(wpm, wpm_install_force_locked_destination_fails_loudly) {
   auto r = force.run();
   CloseHandle(hold);
 
-  // A locked destination is an error, not a silent skip (#1156).
+  // A locked destination is an error, not a silent skip (#1156). The install
+  // now refuses *before* touching anything - a file held by a running process
+  // cannot be replaced at all (delete and overwrite both return Access denied),
+  // so discovering it mid-copy used to leave the package half-applied - and the
+  // refusal names the file to close.
   EXPECT_NE(r.exit_code, 0);
-  EXPECT_CONTAINS(r.stderr_text, "failed to install");
+  EXPECT_CONTAINS(r.stderr_text, "in use and cannot be replaced");
+  EXPECT_CONTAINS(r.stderr_text, "jq.exe");
+  EXPECT_EQ(r.stdout_text.find("installing files"), std::string::npos);
   EXPECT_TRUE(std::filesystem::exists(locked));
 }
 
