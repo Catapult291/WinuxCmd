@@ -4,6 +4,35 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Fixed
+
+- **wpm**: an install is refused **up front** when a destination is held open by
+  a running program, instead of failing halfway through. A file held by another
+  process cannot be replaced on Windows at all — delete and overwrite both
+  return *Access denied* — so the old behaviour could leave a package
+  half-updated; an upgrade of niugit was observed with `opt/niugit` on the new
+  version while the PATH entry still ran the old one. WPM now probes every
+  destination before writing anything, lists the files and the programs running
+  from them, and leaves the installation exactly as it was. Close the listed
+  programs and retry.
+- **wpm**: flat-layout file mappings are copied from the package's **payload**
+  rather than the extraction directory, so a mapping that duplicates a path
+  already covered by a directory mapping no longer produces a second copy of
+  the package and a PATH entry pointing into `.wpm/staging` (the two
+  destinations now share one inode). The staging tree is pruned after a
+  successful install.
+
+### Added
+
+- **wpm**: every package command gets a PATH entry link at
+  `<root>/bin/<cmd>.exe` — a hardlink to the real binary (the payload under
+  `opt/<pkg>/` for shim packages, the mapped binary in `usr/bin/` for flat
+  ones), never a launcher, so nothing extra runs per invocation. The links are
+  recorded in the package receipt and kept in sync by install, update,
+  `wpm links rebuild` and uninstall.
+
 ## [1.1.11] - 2026-10-16
 
 ### Fixed
