@@ -4,7 +4,7 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
-## [Unreleased]
+## [1.1.10] - 2026-10-16
 
 ### Added
 
