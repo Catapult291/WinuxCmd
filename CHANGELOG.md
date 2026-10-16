@@ -4,6 +4,21 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Fixed
+
+- **wpm**: installing a payload file over an existing `usr\bin` command name
+  now breaks the old WinuxCmd multicall hardlink with POSIX-semantics unlink
+  instead of a plain `DeleteFileW`. Every `usr\bin` entry is a link to the
+  same on-disk image as the running `wpm.exe`/`winuxcmd.exe`, so the plain
+  delete self-locked and failed with `Access denied` ("failed to break
+  WinuxCmd hardlink"). Only `layout: flat` packages, whose payload maps the
+  real binary onto `usr\bin\<cmd>.exe`, ever reach this path — first hit by
+  `wpm install niugit --force` (unixwin/niu-git#8). The same POSIX unlink is
+  now used by the stale-link cleanup and alias-replacement paths, which had
+  the identical hazard.
+
 ## [1.1.8] - 2026-10-15
 
 ### Changed

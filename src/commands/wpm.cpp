@@ -675,7 +675,9 @@ auto remove_links(const fs::path& root, bool dry_run) -> int {
       ++removed;
       continue;
     }
-    if (DeleteFileW(target.wstring().c_str())) {
+    // Cluster links name the running image; POSIX unlink only (see
+    // delete_file_name) — plain DeleteFileW fails with Access denied.
+    if (delete_file_name(target)) {
       ++removed;
     } else {
       safeErrorPrintLn(
@@ -2212,7 +2214,10 @@ auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
       continue;
     }
     if (dest_is_winux_link) {
-      if (!DeleteFileW(dest.wstring().c_str())) {
+      // dest is a name of the running wpm/winuxcmd image itself: plain
+      // DeleteFileW would self-lock (Access denied). POSIX unlink removes
+      // only this name, leaving the image alive (see delete_file_name).
+      if (!delete_file_name(dest)) {
         safeErrorPrintLn("wpm: failed to break WinuxCmd hardlink '" +
                          dest.string() +
                          "': " + win32_error_text(GetLastError()));
@@ -2553,7 +2558,9 @@ auto create_package_aliases(const fs::path& root, const nlohmann::json& pkg,
                      destination.string()));
         return false;
       }
-      if (!DeleteFileW(destination.wstring().c_str())) return false;
+      // Alias destination may also be a name of the running image; POSIX
+      // unlink handles cluster links and plain files alike.
+      if (!delete_file_name(destination)) return false;
     }
     if (dry_run) continue;
     if (!CreateHardLinkW(destination.wstring().c_str(),
