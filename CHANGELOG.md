@@ -4,6 +4,20 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Added
+
+- **native_path**: normalized API operands now resolve the shell tree — the bare
+  `/` and every path below the configured install root, `/tmp`, `/var/tmp`,
+  `/home` and the `/mnt/X` WSL drive form — and a shell-namespaced operand's
+  canonical result is re-expressed in the POSIX face, so `readlink -f` and
+  `realpath` agree with `pwd`. The executable-leaf open order (an existing
+  as-spelled path wins, else the `X.exe` sibling) keeps `test -f /usr/bin/seq`
+  and `head -1 /usr/bin/seq` consistent while `ls -d` keeps the operand
+  spelling. The layer is inert unless a shell root is configured, so standalone
+  WinuxCmd keeps its native dialect (unixwin/niubash#346).
+
 ## [1.1.9] - 2026-10-16
 
 ### Fixed
