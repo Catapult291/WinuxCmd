@@ -98,6 +98,237 @@ export auto attributes_are_directory(DWORD attrs) -> bool;
 export auto attributes_are_regular_file(DWORD attrs) -> bool;
 export auto valid_attributes(DWORD attrs) -> bool;
 
+// ---------------------------------------------------------------------------
+// Shell namespace (niubash#346, the "coreutils own the shell tree" boundary).
+//
+// rubash hands its own applets the shell's POSIX spellings verbatim, so the
+// applets resolve them here, mirroring rubash's shell_path_to_windows: "/",
+// every path below the configured install root, /tmp, /var/tmp, /home and the
+// /mnt/X WSL drive form. A foreign process never sees these spellings — rubash
+// translates every non-coreutils child to a native path — so this is the
+// spelling of the shell tree only, not a general POSIX emulation layer. It is
+// inert unless a shell root is configured (the gate the "/" case always used),
+// so standalone WinuxCmd keeps its native-dialect behaviour.
+// ---------------------------------------------------------------------------
+namespace shell_ns {
+
+inline auto read_env_w(const wchar_t* name) -> std::wstring {
+  const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
+  if (needed == 0) return {};
+  std::wstring value(needed, L'\0');
+  const DWORD written = GetEnvironmentVariableW(name, value.data(), needed);
+  if (written == 0 || written >= needed) return {};
+  value.resize(written);
+  return value;
+}
+
+inline auto is_drive_letter(wchar_t ch) -> bool {
+  return (ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z');
+}
+
+// The configured install root (WINUXSH_ROOT and its neutral/compat aliases).
+inline auto root() -> const std::wstring& {
+  static const std::wstring value = [] {
+    for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                             L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+      std::wstring candidate = read_env_w(name);
+      if (!candidate.empty()) return candidate;
+    }
+    return std::wstring{};
+  }();
+  return value;
+}
+
+// MSYS single-character drive form "/X" or "/X/...". No shell mount name
+// collides (they are all multi-letter).
+inline auto is_drive_form(std::wstring_view normalized) -> bool {
+  return normalized.size() >= 2 && is_separator(normalized[0]) &&
+         is_drive_letter(normalized[1]) &&
+         (normalized.size() == 2 || is_separator(normalized[2]));
+}
+
+// Fold an environment-provided base ("C:/x", "/c/x") into the backslash
+// native form join_tail expects.
+inline auto nativeize_base_w(std::wstring_view base) -> std::wstring {
+  std::wstring value = normalize_separators(std::wstring(base));
+  if (value.size() >= 2 && value[0] == L'\\' && is_drive_letter(value[1]) &&
+      (value.size() == 2 || value[2] == L'\\')) {
+    if (value[1] >= L'a' && value[1] <= L'z') {
+      value[1] = static_cast<wchar_t>(value[1] - L'a' + L'A');
+    }
+    value = value[1] + (L":" + value.substr(2));
+  }
+  return value;
+}
+
+inline auto tmp_base_w() -> std::wstring {
+  for (const auto* name : {L"TMPDIR", L"TEMP", L"TMP"}) {
+    std::wstring candidate = read_env_w(name);
+    if (!candidate.empty()) return nativeize_base_w(candidate);
+  }
+  return {};
+}
+
+inline auto home_parent_w() -> std::wstring {
+  for (const auto* name : {L"HOME", L"USERPROFILE"}) {
+    std::wstring candidate = read_env_w(name);
+    if (candidate.empty()) continue;
+    const std::filesystem::path path(nativeize_base_w(candidate));
+    if (path.has_parent_path()) return path.parent_path().wstring();
+  }
+  return {};
+}
+
+// Append a shell tail (the part after the mount name, with or without a
+// leading separator) to a native base, folding "." and ".." lexically like
+// rubash's map_logical_path.
+inline auto join_tail(std::wstring_view tail, std::wstring base)
+    -> std::wstring {
+  std::filesystem::path joined(std::move(base));
+  size_t start = 0;
+  for (;;) {
+    const size_t end = tail.find(L'/', start);
+    const std::wstring_view component = tail.substr(
+        start, end == std::wstring_view::npos ? std::wstring_view::npos
+                                              : end - start);
+    if (component == L"..") {
+      if (joined.has_parent_path()) joined = joined.parent_path();
+    } else if (!component.empty() && component != L".") {
+      joined /= std::wstring(component);
+    }
+    if (end == std::wstring_view::npos) break;
+    start = end + 1;
+  }
+  return joined.wstring();
+}
+
+inline auto has_prefix_ci(std::wstring_view value, std::wstring_view prefix)
+    -> bool {
+  if (value.size() < prefix.size()) return false;
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    wchar_t a = value[i];
+    wchar_t b = prefix[i];
+    if (a >= L'a' && a <= L'z') a = static_cast<wchar_t>(a - L'a' + L'A');
+    if (b >= L'a' && b <= L'z') b = static_cast<wchar_t>(b - L'a' + L'A');
+    if (a != b) return false;
+  }
+  return true;
+}
+
+}  // namespace shell_ns
+
+// Map a shell-namespace spelling to a native path, or nullopt when the
+// operand is not part of the shell namespace (a native/relative path, a
+// double-slash spelling, /dev/*, a drive form handled by the caller, or an
+// unconfigured root).
+auto shell_tree_map_w(std::wstring_view normalized)
+    -> std::optional<std::wstring> {
+  if (shell_ns::root().empty()) return std::nullopt;
+  if (normalized.empty() || !is_separator(normalized[0])) return std::nullopt;
+  if (normalized.size() >= 2 && is_separator(normalized[1])) return std::nullopt;
+  if (shell_ns::is_drive_form(normalized)) return std::nullopt;
+  // /dev is a capability namespace resolved by resolve_pseudo_device_w; its
+  // remaining entries must not silently become ordinary files.
+  if (normalized == L"/dev" || normalized.starts_with(L"/dev/"))
+    return std::nullopt;
+
+  if (normalized == L"/tmp" || normalized.starts_with(L"/tmp/")) {
+    std::wstring base = shell_ns::tmp_base_w();
+    if (base.empty()) return std::nullopt;
+    return shell_ns::join_tail(normalized.substr(4), std::move(base));
+  }
+  if (normalized == L"/var/tmp" || normalized.starts_with(L"/var/tmp/")) {
+    std::wstring base = shell_ns::tmp_base_w();
+    if (base.empty()) return std::nullopt;
+    return shell_ns::join_tail(
+        normalized.substr(8),
+        (std::filesystem::path(std::move(base)) / L"var" / L"tmp").wstring());
+  }
+  if (normalized == L"/home" || normalized.starts_with(L"/home/")) {
+    std::wstring base = shell_ns::home_parent_w();
+    if (base.empty()) return std::nullopt;
+    return shell_ns::join_tail(normalized.substr(5), std::move(base));
+  }
+  if (normalized.size() >= 6 && normalized.starts_with(L"/mnt/") &&
+      shell_ns::is_drive_letter(normalized[5]) &&
+      (normalized.size() == 6 || is_separator(normalized[6]))) {
+    wchar_t drive = normalized[5];
+    if (drive >= L'a' && drive <= L'z') {
+      drive = static_cast<wchar_t>(drive - L'a' + L'A');
+    }
+    std::wstring base;
+    base.push_back(drive);
+    base.append(L":\\");
+    const std::wstring_view rest =
+        normalized.size() > 6 ? normalized.substr(7) : std::wstring_view{};
+    return shell_ns::join_tail(rest, std::move(base));
+  }
+
+  // Everything else (including the bare "/") is relative to the install root.
+  return shell_ns::join_tail(normalized.substr(1),
+                             shell_ns::nativeize_base_w(shell_ns::root()));
+}
+
+// Resolve a shell-namespace operand through the shell tree, applying the MSYS
+// open order the engine's niubash#177 funnel used to apply: an existing
+// as-spelled path wins; otherwise the toolset's `X.exe` leaf resolves the bare
+// `/usr/bin/X` spelling. Without this, `ls /usr/bin/seq`, `test -f
+// /usr/bin/seq` and `head -1 /usr/bin/seq` (only `seq.exe` on disk) would
+// regress once rubash stops translating the spelling for the coreutils class.
+auto shell_tree_to_native_w(std::wstring_view normalized)
+    -> std::optional<std::wstring> {
+  auto mapped = shell_tree_map_w(normalized);
+  if (!mapped) return std::nullopt;
+  if (!mapped->empty() && !is_separator(mapped->back()) &&
+      !valid_attributes(attributes_w(*mapped))) {
+    std::wstring exe = *mapped + L".exe";
+    if (valid_attributes(attributes_w(exe))) {
+      *mapped = std::move(exe);
+    }
+  }
+  return mapped;
+}
+
+// Re-express a native path back in the shell namespace: the canonical
+// spelling of a path under a shell mount is its POSIX mount name. Returns
+// nullopt when the path is not under any mount (native paths stay native).
+auto shell_tree_display_w(std::wstring_view native)
+    -> std::optional<std::wstring> {
+  const std::wstring value = normalize_separators(std::wstring(native));
+
+  const auto under =
+      [&](std::wstring_view raw_base,
+          std::wstring_view mount) -> std::optional<std::wstring> {
+    const std::wstring base = shell_ns::nativeize_base_w(raw_base);
+    if (base.empty() || !shell_ns::has_prefix_ci(value, base))
+      return std::nullopt;
+    if (value.size() > base.size() && !is_separator(value[base.size()]))
+      return std::nullopt;
+    std::wstring result(mount);
+    for (size_t i = base.size(); i < value.size(); ++i) {
+      result.push_back(value[i] == L'\\' ? L'/' : value[i]);
+    }
+    return result;
+  };
+
+  const std::wstring root = shell_ns::root();
+  if (!root.empty()) {
+    if (auto mapped = under(root, L"")) {
+      return mapped->empty() ? std::wstring(L"/") : *mapped;
+    }
+  }
+  const std::wstring tmp = shell_ns::tmp_base_w();
+  if (!tmp.empty()) {
+    if (auto mapped = under(
+            (std::filesystem::path(tmp) / L"var" / L"tmp").wstring(),
+            L"/var/tmp")) {
+      return mapped;
+    }
+    if (auto mapped = under(tmp, L"/tmp")) return mapped;
+  }
+  return under(shell_ns::home_parent_w(), L"/home");
+}
+
 export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
   const bool had_trailing_separator =
       strip_trailing_separators(path).size() != path.size();
@@ -105,21 +336,6 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
   if (!normalized.empty() &&
       normalized.find_first_not_of(L'/') == std::wstring::npos) {
     normalized = L"/";
-  }
-  if (normalized == L"/") {
-    for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
-                             L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
-      const DWORD needed = GetEnvironmentVariableW(name, nullptr, 0);
-      if (needed == 0) continue;
-      std::wstring root(needed, L'\0');
-      const DWORD written = GetEnvironmentVariableW(name, root.data(), needed);
-      if (written == 0 || written >= needed) continue;
-      root.resize(written);
-      normalized = root.find_first_not_of(L'/') == std::wstring::npos
-                       ? L"\\"
-                       : normalize_api_operand_w(root);
-      break;
-    }
   }
   // Cygwin drive prefix: /cygdrive/d/... names the same file as /d/... and
   // D:\... (the GNU runtime layer resolves every spelling; cygpath/mktemp
@@ -168,6 +384,16 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
       drive_path.append(normalized.substr(3));
     }
     normalized = normalize_separators(std::move(drive_path));
+  }
+  // niubash#346: after the cygdrive/drive folds above, any remaining
+  // "/"-prefixed operand is a shell-namespace spelling (the bare "/", a
+  // virtual root, /tmp, /home, /mnt/X). The bundled coreutils receive these
+  // verbatim, so resolve them through the shell tree exactly like rubash's
+  // shell_path_to_windows.
+  if (!normalized.empty() && is_separator(normalized[0])) {
+    if (auto mapped = shell_tree_to_native_w(normalized)) {
+      normalized = std::move(*mapped);
+    }
   }
   // A trailing separator means the operand must name a directory (POSIX
   // ENOTDIR). If the stripped target is not a directory, keep a separator so
@@ -778,7 +1004,18 @@ export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
                                 bool expand_symlinks = true,
                                 bool logical = false)
     -> std::expected<std::wstring, int> {
-  std::filesystem::path input{std::wstring(path)};
+  // niubash#346: the shell hands its own applets POSIX spellings verbatim
+  // (/usr/bin, /etc, /tmp, /home, /mnt/x). Resolve the operand through the
+  // shell tree first, and re-express the result in the shell spelling when
+  // the operand was a shell-namespace one — the shell tree's canonical name
+  // is its POSIX mount name, so readlink -f/realpath agree with pwd.
+  std::optional<std::wstring> shell_input;
+  std::wstring effective(path);
+  if (auto mapped = shell_tree_to_native_w(strip_trailing_separators(path))) {
+    shell_input = *mapped;
+    effective = *mapped;
+  }
+  std::filesystem::path input{std::move(effective)};
   const bool needs_directory =
       strip_trailing_separators(path).size() != path.size();
 
@@ -890,6 +1127,7 @@ export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
   // Prefer the kernel-canonical spelling (resolves 8.3 names and restores
   // on-disk casing) whenever the whole path exists.
   const std::wstring finished = current.wstring();
+  std::wstring canonical = finished;
   if (mode != CanonMode::missing && valid_attributes(attributes_w(finished))) {
     const std::wstring native = to_extended_path(finished);
     HANDLE handle = CreateFileW(
@@ -905,16 +1143,21 @@ export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
       if (written > 0 && written < buffer.size()) {
         buffer.resize(written);
         if (buffer.rfind(L"\\\\?\\UNC\\", 0) == 0) {
-          return L"\\\\" + buffer.substr(8);
+          canonical = L"\\\\" + buffer.substr(8);
+        } else if (buffer.rfind(L"\\\\?\\", 0) == 0) {
+          canonical = buffer.substr(4);
+        } else {
+          canonical = buffer;
         }
-        if (buffer.rfind(L"\\\\?\\", 0) == 0) {
-          return buffer.substr(4);
-        }
-        return buffer;
       }
     }
   }
-  return finished;
+  if (shell_input) {
+    if (auto display = shell_tree_display_w(canonical)) {
+      canonical = std::move(*display);
+    }
+  }
+  return canonical;
 }
 
 export auto canonicalize_path(std::string_view path, CanonMode mode,
