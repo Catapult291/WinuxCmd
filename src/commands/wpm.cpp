@@ -69,8 +69,8 @@ constexpr std::string_view kBuiltinIndex = R"json(
 {
   "schema": 1,
   "name": "official",
-  "version": "builtin-2026.10.16",
-  "updated": "2026-10-16",
+  "version": "builtin-2026.10.17",
+  "updated": "2026-10-17",
   "sources": [
     {
       "name": "official-github-raw",

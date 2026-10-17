@@ -4,6 +4,37 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [1.1.13] - 2026-10-17
+
+### Fixed
+
+- **wpm**: a package upgrade now replaces files that a running program holds
+  open, instead of failing halfway. 1.1.12 refused up front when it *thought* a
+  destination could not be replaced, but the probe it used — opening the name
+  with `DELETE` access — succeeds against a file another process has mapped as
+  its image, while the delete and the overwrite that follow both fail with
+  Access denied. On a real installation this meant `wpm install niugit --force`
+  still failed while git's `fsmonitor--daemon` held
+  `libexec/git-core/git.exe`, and it failed *after* the reconcile and the entry
+  links had run, leaving the package half-updated.
+
+  Destinations are now **renamed aside** (`<name>.wpm-old-<pid>`) before
+  anything is written: a rename is exactly what a mapped image permits, the
+  running process keeps its old bytes, and the operation is reversible. If a
+  destination cannot even be renamed, the ones already parked are put back and
+  the install refuses with the culprit and the processes running from it — so
+  an upgrade is either complete or untouched. Once the install commits, the
+  parked names are deleted; while the old process still holds them the name
+  stays, and `wpm clean` removes it later.
+- **wpm**: a superseded path the new version no longer maps is parked the same
+  way instead of aborting the upgrade when a live process holds it.
+- **wpm**: `wpm clean staging` and `wpm clean all` also remove parked
+  `.wpm-old-<pid>` names left by earlier installs.
+
+Verified on a live installation with 28 `fsmonitor--daemon` processes holding
+the payload: the forced upgrade succeeds, `usr/bin/git.exe` and `bin/git.exe`
+both share the payload inode, and `.wpm/staging` is pruned.
+
 ## [1.1.12] - 2026-10-16
 
 ### Fixed
