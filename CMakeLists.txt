@@ -328,6 +328,21 @@ if (WIN32)
     )
 endif ()
 
+# Package shim: the forwarder behind `usr\bin\<command>.exe` for
+# `layout: shim` packages. It runs `opt\<pkg>\<command>.exe` from the map wpm
+# writes, instead of paying a whole WinuxCmd startup per invocation
+# (unixwin/WinuxCmd#1207). Deliberately depends on nothing but the C runtime.
+add_executable(winuxcmd-shim src/shims/winuxcmd_shim.cpp)
+if (WIN32)
+    target_compile_options(winuxcmd-shim PRIVATE /W4 /EHsc /MT /Os)
+    target_link_options(winuxcmd-shim PRIVATE /SUBSYSTEM:CONSOLE)
+    add_custom_command(TARGET winuxcmd-shim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:winuxcmd-shim> ${CMAKE_BINARY_DIR}/usr/bin/winuxcmd-shim.exe
+        COMMENT "Copying winuxcmd-shim.exe to usr/bin..."
+    )
+endif ()
+
 # PCH for winuxcmd
 target_precompile_headers(winuxcmd PRIVATE ${CMAKE_SOURCE_DIR}/src/pch/pch.h)
 
