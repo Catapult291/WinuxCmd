@@ -930,6 +930,52 @@ auto print_cleanup_progress(std::string_view key, std::string_view kind,
                      percent, done, total, human_size(bytes)));
 }
 
+/// The name a replaced file is parked under until the install commits;
+/// leftovers of an interrupted run are swept by `wpm clean`.
+constexpr std::string_view kReplacedMarker = ".wpm-old-";
+
+/// Parked names a previous install had to leave behind (their holder has
+/// usually exited by now).
+auto sweep_replaced_leftovers(const fs::path& root, bool dry_run, bool verbose)
+    -> std::pair<size_t, uintmax_t> {
+  size_t files = 0;
+  uintmax_t bytes = 0;
+  for (const char* sub : {"opt", "usr/bin", "bin"}) {
+    const fs::path base = root / sub;
+    std::error_code exists_ec;
+    if (!fs::exists(base, exists_ec)) continue;
+    std::error_code walk_ec;
+    for (const auto& entry : fs::recursive_directory_iterator(
+             base, fs::directory_options::skip_permission_denied, walk_ec)) {
+      if (walk_ec) break;
+      std::error_code type_ec;
+      if (!entry.is_regular_file(type_ec)) continue;
+      if (entry.path().filename().string().find(kReplacedMarker) ==
+          std::string::npos)
+        continue;
+      std::error_code size_ec;
+      const uintmax_t size = fs::file_size(entry.path(), size_ec);
+      if (dry_run) {
+        if (verbose) safePrintLn("wpm: would remove " + entry.path().string());
+        ++files;
+        if (!size_ec) bytes += size;
+        continue;
+      }
+      std::error_code remove_ec;
+      fs::remove(entry.path(), remove_ec);
+      if (remove_ec) {
+        if (verbose)
+          safeErrorPrintLn("wpm: could not remove " + entry.path().string() +
+                           ": " + remove_ec.message());
+        continue;
+      }
+      ++files;
+      if (!size_ec) bytes += size;
+    }
+  }
+  return {files, bytes};
+}
+
 auto remove_tree(const fs::path& target, std::string_view kind, bool verbose,
                  bool show_progress = true,
                  std::string_view progress_key =
@@ -999,17 +1045,43 @@ auto clean_state_directory(const fs::path& root, std::string_view kind,
   return 0;
 }
 
+/// Remove the parked names installs had to leave behind (their holder has
+/// usually exited by the time anyone runs this).
+auto clean_replaced_leftovers(const Options& opts) -> int {
+  const auto [files, bytes] =
+      sweep_replaced_leftovers(opts.root, opts.dry_run, opts.verbose);
+  if (files == 0) return 0;
+  if (opts.dry_run) {
+    safePrintLn(wpm_text("command.wpm.status.clean_leftovers_dry_run",
+                         "wpm: would remove {} parked file(s) ({})", files,
+                         human_size(bytes)));
+    return 0;
+  }
+  safePrintLn(wpm_text("command.wpm.status.clean_leftovers",
+                       "wpm: removed {} parked file(s) ({})", files,
+                       human_size(bytes)));
+  return 0;
+}
+
 auto clean_state(const Options& opts, std::string_view selection) -> int {
   std::string kind(selection);
   if (kind.empty() || kind == "all") {
     int result =
         clean_state_directory(opts.root, "cache", opts.dry_run, opts.verbose);
     if (result != 0) return result;
-    return clean_state_directory(opts.root, "staging", opts.dry_run,
-                                 opts.verbose);
+    result = clean_state_directory(opts.root, "staging", opts.dry_run,
+                                   opts.verbose);
+    if (result != 0) return result;
+    return clean_replaced_leftovers(opts);
   }
-  if (kind == "cache" || kind == "staging")
+  if (kind == "cache")
     return clean_state_directory(opts.root, kind, opts.dry_run, opts.verbose);
+  if (kind == "staging") {
+    int result =
+        clean_state_directory(opts.root, kind, opts.dry_run, opts.verbose);
+    if (result != 0) return result;
+    return clean_replaced_leftovers(opts);
+  }
   safeErrorPrintLn(
       winux::i18n::translate("command.wpm.error.usage.clean",
                              "wpm: usage: wpm clean [cache|staging|all]"));
@@ -2258,25 +2330,8 @@ auto create_package_entry_links(const fs::path& root, const nlohmann::json& pkg,
   return true;
 }
 
-/// Can this name be replaced at all? A file held by a running process -git's
-/// `fsmonitor--daemon` keeps `libexec/git-core/git.exe` mapped while any
-/// monitored repository lives, an editor holds `git.exe` - denies delete *and*
-/// overwrite with Access denied (measured), so an upgrade that finds out
-/// mid-copy aborts half-applied: payload directories updated, the PATH entry
-/// still on the old version. Ask first.
-auto name_is_replaceable(const fs::path& target) -> bool {
-  HANDLE handle = CreateFileW(target.wstring().c_str(), DELETE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                  FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING,
-                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-  if (handle == INVALID_HANDLE_VALUE) return false;
-  CloseHandle(handle);
-  return true;
-}
-
-/// The main image of every process running from `target` (the usual holder of
-/// a payload file, and the one a user can actually close).
+/// The main image of every process running from `target` (the usual holder of a
+/// payload file, and the one a user can actually close).
 auto processes_running_from(const fs::path& target) -> std::vector<std::string> {
   std::vector<std::string> holders;
   const auto wanted = normalized_path_key(target);  // std::wstring key
@@ -2303,56 +2358,149 @@ auto processes_running_from(const fs::path& target) -> std::vector<std::string> 
   return holders;
 }
 
-/// Destinations this artifact would have to replace but cannot, with the
-/// processes to close. Empty means the install can proceed safely.
+/// A destination this artifact has to replace but cannot even rename, with the
+/// processes to close.
 struct BlockedReplacement {
   fs::path target;
   std::vector<std::string> holders;
 };
 
-auto preflight_replacements(const fs::path& extracted, const fs::path& root,
-                            const nlohmann::json& artifact,
-                            std::string_view package)
-    -> std::vector<BlockedReplacement> {
+/// A destination parked out of the way so the new bytes can take its name.
+struct StagedReplacement {
+  fs::path original;
+  fs::path parked;
+};
+
+/// Park `target` so its name becomes free. Renaming - not deleting - is what
+/// works on a file another process has mapped: measured on a live install,
+/// `CreateFileW(DELETE)` *succeeds* against git's fsmonitor daemon holding
+/// `libexec/git-core/git.exe`, while `SetFileInformationByHandle(
+/// FILE_DISPOSITION_INFO)` and an in-place overwrite both fail with Access
+/// denied. A "can I delete this name?" probe therefore lies in exactly the case
+/// that matters, and the honest answer is the operation itself: the rename
+/// leaves the running process on its old inode and is reversible until the
+/// install commits (unixwin/WinuxCmd#1188).
+auto move_aside(const fs::path& target, fs::path* parked_out) -> bool {
+  if (parked_out == nullptr) return false;
+  fs::path parked = target;
+  parked += std::string(kReplacedMarker) + std::to_string(GetCurrentProcessId());
+  std::error_code leftover_ec;
+  fs::remove(parked, leftover_ec);  // from an interrupted install, if any
+  std::error_code ec;
+  fs::rename(target, parked, ec);
+  if (ec) return false;
+  *parked_out = std::move(parked);
+  return true;
+}
+
+/// What one install parked, and what it could not park.
+struct ReplacementStaging {
+  std::vector<StagedReplacement> parked;
   std::vector<BlockedReplacement> blocked;
+};
+
+auto restore_parked(const std::vector<StagedReplacement>& parked) {
+  for (const auto& item : parked) {
+    std::error_code ec;
+    fs::rename(item.parked, item.original, ec);
+  }
+}
+
+/// Drop the parked copies. Best effort by design: while the old process still
+/// holds them the bytes cannot be removed, so the name stays until `wpm clean`
+/// (or the next install of the same package) can take it.
+auto discard_parked(const ReplacementStaging& staging, bool verbose) -> size_t {
+  size_t leftovers = 0;
+  for (const auto& item : staging.parked) {
+    std::error_code ec;
+    fs::remove(item.parked, ec);
+    if (ec) {
+      ++leftovers;
+      if (verbose)
+        safeErrorPrintLn("wpm: note: '" + item.parked.string() +
+                         "' is still held by a running process; `wpm clean "
+                         "staging` removes it later");
+    }
+  }
+  return leftovers;
+}
+
+/// Park every destination this artifact will replace, in one pass, before
+/// anything is written. A failure anywhere restores what was already parked, so
+/// the installation is either fully staged or untouched - never half-updated
+/// (the failure that used to leave `opt/niugit` on the new version while the
+/// PATH entry still ran the old one).
+auto stage_replacements(const fs::path& extracted, const fs::path& root,
+                        const nlohmann::json& artifact,
+                        std::string_view package, const nlohmann::json& pkg)
+    -> ReplacementStaging {
+  ReplacementStaging staging;
   const fs::path core = canonical_winuxcmd_path(root);
   const fs::path current = current_exe_path();
   const bool single_file_fallback = artifact.value("type", "exe") == "exe";
-  if (!artifact.contains("files") || !artifact["files"].is_array())
-    return blocked;
 
-  auto check = [&](const fs::path& target) {
+  std::vector<fs::path> targets;
+  auto add_target = [&](const fs::path& target) {
     std::error_code exists_ec;
     if (!fs::exists(target, exists_ec)) return;
     if (same_file(core, target) || same_path_name(current, target)) return;
-    if (name_is_replaceable(target)) return;
-    blocked.push_back({target, processes_running_from(target)});
+    const auto key = normalized_path_key(target);
+    for (const auto& existing : targets)
+      if (normalized_path_key(existing) == key) return;
+    targets.push_back(target);
   };
 
-  for (const auto& mapping : artifact["files"]) {
-    const bool directory = mapping_is_directory(mapping);
-    auto dest = artifact_destination_for_mapping(root, artifact, package, mapping);
-    if (!dest) continue;
-    if (!directory) {
-      check(*dest);
-      continue;
-    }
-    const std::string from = mapping.value("from", "");
-    auto source = find_artifact_path(extracted, from, true, single_file_fallback);
-    if (!source) continue;
-    std::error_code walk_ec;
-    for (const auto& entry : fs::recursive_directory_iterator(
-             *source, fs::directory_options::skip_permission_denied, walk_ec)) {
-      if (walk_ec) break;
-      std::error_code type_ec;
-      if (!entry.is_regular_file(type_ec)) continue;
-      std::error_code rel_ec;
-      const fs::path relative = fs::relative(entry.path(), *source, rel_ec);
-      if (rel_ec) continue;
-      check(*dest / relative);
+  if (artifact.contains("files") && artifact["files"].is_array()) {
+    for (const auto& mapping : artifact["files"]) {
+      const bool directory = mapping_is_directory(mapping);
+      auto dest =
+          artifact_destination_for_mapping(root, artifact, package, mapping);
+      if (!dest) continue;
+      if (!directory) {
+        add_target(*dest);
+        continue;
+      }
+      const std::string from = mapping.value("from", "");
+      auto source =
+          find_artifact_path(extracted, from, true, single_file_fallback);
+      if (!source) continue;
+      std::error_code walk_ec;
+      for (const auto& entry : fs::recursive_directory_iterator(
+               *source, fs::directory_options::skip_permission_denied,
+               walk_ec)) {
+        if (walk_ec) break;
+        std::error_code type_ec;
+        if (!entry.is_regular_file(type_ec)) continue;
+        std::error_code rel_ec;
+        const fs::path relative = fs::relative(entry.path(), *source, rel_ec);
+        if (rel_ec) continue;
+        add_target(*dest / relative);
+      }
     }
   }
-  return blocked;
+  // The PATH entry links this package owns are replaced too, and a program
+  // running from one of them holds it just like a payload file.
+  for (const auto& [payload, link] : package_entry_links(root, pkg, artifact)) {
+    (void)payload;
+    add_target(link);
+  }
+
+  for (const auto& target : targets) {
+    fs::path parked;
+    if (move_aside(target, &parked)) {
+      staging.parked.push_back({target, std::move(parked)});
+      continue;
+    }
+    staging.blocked.push_back({target, processes_running_from(target)});
+  }
+
+  if (!staging.blocked.empty()) {
+    // Nothing has been written yet: put back everything that was parked so the
+    // user retries from an unwounded installation.
+    restore_parked(staging.parked);
+    staging.parked.clear();
+  }
+  return staging;
 }
 
 auto copy_artifact_files(const fs::path& extracted, const fs::path& root,
@@ -3133,8 +3281,22 @@ auto prune_superseded_install(const fs::path& root, const std::string& package,
     std::error_code remove_ec;
     if (directory) {
       fs::remove_all(previous, remove_ec);
-    } else if (!delete_file_name(previous)) {
-      remove_ec = std::error_code(GetLastError(), std::system_category());
+    } else {
+      std::error_code direct_ec;
+      fs::remove(previous, direct_ec);
+      if (direct_ec) {
+        // Held by a live process: park it instead of aborting the upgrade, and
+        // let the cleanup take the bytes once the holder is gone.
+        fs::path parked;
+        if (move_aside(previous, &parked)) {
+          std::error_code parked_ec;
+          fs::remove(parked, parked_ec);
+          if (verbose)
+            safePrintLn("wpm: parked superseded path " + previous.string());
+        } else {
+          remove_ec = direct_ec;
+        }
+      }
     }
     if (remove_ec) {
       safeErrorPrintLn("wpm: failed to remove superseded path '" +
@@ -3277,18 +3439,20 @@ auto install_package(const Options& opts, std::string_view package_name,
     return finish(false, "error");
   }
 
-  // Ask before touching anything: a payload file held by a running process
-  // cannot be replaced (delete and overwrite both return Access denied), and
-  // discovering that mid-copy leaves the package half-updated - directories on
-  // the new version, the PATH entry on the old one. Refusing up front keeps
-  // the installation consistent and tells the user what to close.
+  // Park every destination before writing anything. A file held by a running
+  // process cannot be deleted or overwritten - but it can be *renamed* aside,
+  // which is how a package with a live fsmonitor daemon still upgrades - and a
+  // destination that cannot even be renamed refuses the install up front, with
+  // the culprit named, instead of failing halfway and leaving the package
+  // half-updated.
+  ReplacementStaging staging;
   if (!opts.dry_run) {
-    const auto blocked = preflight_replacements(
+    staging = stage_replacements(
         extracted, opts.root, *artifact,
-        pkg->value("name", std::string(package_name)));
-    if (!blocked.empty()) {
+        pkg->value("name", std::string(package_name)), *pkg);
+    if (!staging.blocked.empty()) {
       std::string detail;
-      for (const auto& item : blocked) {
+      for (const auto& item : staging.blocked) {
         detail += "\n  " + item.target.string();
         if (item.holders.empty()) {
           detail += "\n      (held by a process that cannot be named)";
@@ -3301,7 +3465,7 @@ auto install_package(const Options& opts, std::string_view package_name,
           "wpm: {} file(s) are in use and cannot be replaced; close the listed "
           "programs (a running git, an editor's git integration, a fsmonitor "
           "daemon) and retry:{}",
-          blocked.size(), detail);
+          staging.blocked.size(), detail);
       safeErrorPrintLn(line);
       json_errors.push_back(line);
       return finish(false, "files_in_use");
@@ -3363,6 +3527,7 @@ auto install_package(const Options& opts, std::string_view package_name,
     return finish(false, "error");
   }
   write_install_receipt(opts.root, *pkg, *artifact);
+  discard_parked(staging, opts.verbose);
   // The extraction directory has served its purpose and would otherwise keep a
   // second copy of the payload - and, historically, the inode the PATH entry
   // pointed at - alive under a directory that reads as transient.
