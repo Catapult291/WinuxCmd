@@ -1610,6 +1610,108 @@ TEST(wpm, wpm_install_force_locked_destination_fails_loudly) {
   EXPECT_TRUE(std::filesystem::exists(locked));
 }
 
+TEST(wpm, wpm_install_replaces_a_destination_a_process_runs_from) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+
+  // The fixture artifact is a real executable installed under an applet name,
+  // so the installed destination can actually be started - which is the shape
+  // git's fsmonitor daemon leaves behind for libexec/git-core/git.exe.
+  const auto artifact_path = tmp.path / L"source" / L"sleep.exe";
+  std::filesystem::create_directories(artifact_path.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), artifact_path,
+                             std::filesystem::copy_options::overwrite_existing);
+  const auto sha = sha256_file_hex(artifact_path);
+  ASSERT_EQ(sha.size(), 64u);
+  if (sha.size() != 64) return;
+  tmp.write(".wpm/indexes/official.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-live-image\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"sleeper\",\"version\":\"1.0.0\","
+            "\"description\":\"live image fixture\","
+            "\"kind\":\"external\",\"commands\":[\"sleep\"],"
+            "\"artifacts\":{\"" +
+                current_arch_key() + "\":{\"type\":\"exe\",\"sha256\":\"" +
+                sha + "\",\"urls\":[\"" + file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"sleep.exe\","
+                "\"to\":\"sleep.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"sleeper", L"--root", tmp.wpath()});
+  auto install_result = install.run();
+  ASSERT_EQ(install_result.exit_code, 0);
+  if (install_result.exit_code != 0) return;
+
+  const auto destination = tmp.path / L"usr" / L"bin" / L"sleep.exe";
+  ASSERT_TRUE(std::filesystem::exists(destination));
+
+  // Start a process whose image is the destination. It refuses delete and
+  // overwrite (Access denied) but can be renamed aside, so the upgrade must
+  // complete by parking the old name.
+  std::wstring command = L"\"" + destination.wstring() + L"\" 30";
+  std::vector<wchar_t> mutable_command(command.begin(), command.end());
+  mutable_command.push_back(L'\0');
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  const auto started =
+      CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+  ASSERT_TRUE(started);
+  if (!started) return;
+
+  Pipeline force;
+  force.add(L"winuxcmd.exe", {L"wpm", L"install", L"sleeper", L"--force",
+                              L"--root", tmp.wpath()});
+  auto r = force.run();
+
+  TerminateProcess(process.hProcess, 0);
+  WaitForSingleObject(process.hProcess, 5000);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text, "installing files");
+  EXPECT_NOT_CONTAINS(r.stdout_text, "already installed");
+  EXPECT_CONTAINS(r.stdout_text, "installed sleeper");
+  EXPECT_TRUE(std::filesystem::exists(destination));
+  EXPECT_NOT_CONTAINS(r.stderr_text, "failed to replace");
+  EXPECT_NOT_CONTAINS(r.stderr_text, "in use and cannot be replaced");
+  // The name now holds a new file, while the process keeps running from the
+  // old inode (visible through the spare link).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text, "installing files");
+  EXPECT_NOT_CONTAINS(r.stdout_text, "already installed");
+  EXPECT_CONTAINS(r.stdout_text, "installed sleeper");
+  EXPECT_TRUE(std::filesystem::exists(destination));
+  EXPECT_NOT_CONTAINS(r.stderr_text, "failed to replace");
+  EXPECT_NOT_CONTAINS(r.stderr_text, "in use and cannot be replaced");
+  // Both the parked old bytes (the running process keeps them) and the new file
+  // under the destination must still be executable.
+  EXPECT_TRUE(std::filesystem::exists(destination));
+  Pipeline still_works;
+  still_works.add(destination.wstring(), {L"0"});
+  EXPECT_EQ(still_works.run().exit_code, 0);
+
+  // The parked names are cleaned up by `wpm clean` when their holder is gone.
+  Pipeline clean;
+  clean.add(L"winuxcmd.exe",
+            {L"wpm", L"clean", L"staging", L"--root", tmp.wpath()});
+  auto cleaned = clean.run();
+  EXPECT_EQ(cleaned.exit_code, 0);
+  EXPECT_TRUE(std::filesystem::exists(destination));
+  EXPECT_NOT_CONTAINS(cleaned.stderr_text, "failed to clean");
+}
+
 TEST(wpm, wpm_outdated_uses_receipt_version_after_index_update) {
   TempDir tmp;
   const auto artifact_path = tmp.path / L"source" / L"jq.exe";
