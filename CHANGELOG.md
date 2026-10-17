@@ -4,6 +4,33 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [1.1.14] - 2026-10-17
+
+### Added
+
+- **wpm**: `wpm links verify` reports, by path, every command link that does not
+  run the installed `winuxcmd.exe` - the diagnosis that was missing while a
+  stale link could keep one command on an older build for hours without a word.
+- **wpm**: `winuxcmd-shim.exe`, a small forwarder behind `layout: shim`
+  packages. `usr\bin\python.exe` and its siblings used to be a hardlink to an
+  older `winuxcmd.exe` whose only job was to spawn `opt\<pkg>\<command>.exe`,
+  so every `python`/`node`/`curl`/`ssh` call paid a whole WinuxCmd startup; the
+  dispatch hop drops from a measured 24.5 ms to 12.1 ms. An installation without
+  the forwarder keeps the previous behaviour, and `wpm links rebuild --force`
+  (which activation already runs) switches existing installs over.
+
+### Fixed
+
+- **wpm**: `wpm update winuxcmd` no longer leaves a command link on the previous
+  image silently. A link that cannot be deleted is parked and replaced, the
+  failing link is named, the links are verified after the swap and relinked
+  once, and the detached update helper writes its output to
+  `.wpm\logs\self-update-<stamp>-<pid>.log` (newest three kept) instead of
+  discarding it.
+- **wpm**: the self-update keeps the newest two rollback copies of
+  `winuxcmd.exe` and prunes older ones - one machine had accumulated 61.8 MB -
+  and `wpm clean backup` (and `clean all`) reclaims them.
+
 ## [1.1.13] - 2026-10-17
 
 ### Fixed
