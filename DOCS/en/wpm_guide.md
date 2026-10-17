@@ -148,6 +148,14 @@ wpm erase gzip --dry-run
 
 Update the WinuxCmd binary itself from the local package index. A backup of the current `winuxcmd.exe` is saved to `.wpm/backup/` before replacement.
 
+The replacement is **asynchronous**: the command returns as soon as the download
+is staged, and a helper waits for the updating process to exit (up to 30 s)
+before swapping the image and relinking every command. Checking versions or the
+link set immediately after it returns can therefore show the *previous* build -
+that is a timing window, not a failed update. `wpm links rebuild --force`
+recreates the command links from the installed image at any time if one was left
+behind, and names any link it cannot replace.
+
 ```bash
 wpm update winuxcmd
 ```

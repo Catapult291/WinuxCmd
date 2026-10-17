@@ -590,6 +590,10 @@ auto materialize_command_link(const fs::path& source, const fs::path& target)
   return ec;
 }
 
+/// Defined with the package-upgrade path below; the command-link rebuild needs
+/// it too, to park a stale name it cannot delete.
+auto move_aside(const fs::path& target, fs::path* parked_out) -> bool;
+
 auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
     -> int {
   const fs::path canonical_source = canonical_winuxcmd_path(root);
@@ -620,6 +624,29 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
       continue;
     }
     if (!remove_link_if_safe(source, target, current, force, dry_run)) {
+      // A stale name that cannot be deleted - a process still holding it, or a
+      // name some other tool created - must not leave this command on the
+      // previous image. Park it and link the new one over the freed name, the
+      // same way a package upgrade replaces a held payload file
+      // (unixwin/WinuxCmd#1194); if even the rename is refused, say which name
+      // it was instead of leaving a bare count behind.
+      fs::path parked;
+      if (!dry_run && move_aside(target, &parked)) {
+        auto relink_error = materialize_command_link(source, target);
+        if (!relink_error) {
+          std::error_code parked_ec;
+          fs::remove(parked, parked_ec);
+          ++created;
+          if (verbose)
+            safePrintLn("wpm: relinked " + target.string() +
+                        " (parked the previous name)");
+          continue;
+        }
+        std::error_code restore_ec;
+        fs::rename(parked, target, restore_ec);
+      }
+      safeErrorPrintLn("wpm: failed to replace the command link '" +
+                       target.string() + "'");
       ++failed;
       continue;
     }
@@ -643,6 +670,10 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
       safeErrorPrintLn(wpm_text("command.wpm.error.create_link",
                                 "wpm: failed to create hard link '{}': {}",
                                 target.string(), link_error.message()));
+      // Say what the consequence is: this name keeps running the previous
+      // image until something relinks it.
+      safeErrorPrintLn("wpm: '" + target.string() +
+                       "' still points at the previous winuxcmd.exe");
       ++failed;
     }
   }
@@ -652,6 +683,53 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
                "wpm: links created={} unchanged={} stale_removed={} failed={}",
                created, unchanged, stale_removed, failed));
   return failed == 0 ? 0 : 1;
+}
+
+/// Names in `usr/bin` that should point at this installation's `winuxcmd.exe`
+/// but point somewhere else. That is the residue of an update which could not
+/// replace one of them - the command then runs an older build forever, and
+/// nothing else notices (unixwin/WinuxCmd#1206). Absent names are not stale:
+/// the command set is created, never guaranteed complete.
+auto stale_command_links(const fs::path& root) -> std::vector<std::string> {
+  std::vector<std::string> stale;
+  const fs::path canonical_source = canonical_winuxcmd_path(root);
+  const fs::path legacy_source = root / "winuxcmd.exe";
+  const fs::path source = fs::exists(canonical_source) ? canonical_source
+                          : fs::exists(legacy_source)  ? legacy_source
+                                                       : current_exe_path();
+  std::error_code exists_ec;
+  if (!fs::exists(source, exists_ec)) return stale;
+  const fs::path current = current_exe_path();
+  for (const auto& name : command_names()) {
+    const fs::path target = canonical_bin_dir(root) / exe_suffix(name);
+    std::error_code target_ec;
+    if (!fs::exists(target, target_ec)) continue;
+    if (same_file(source, target)) continue;
+    if (same_path_name(current, target)) continue;  // the running image
+    stale.emplace_back(name);
+  }
+  return stale;
+}
+
+/// `wpm links verify`: report, by name, the commands that do not run the
+/// installed image.
+auto verify_links(const Options& opts) -> int {
+  const auto stale = stale_command_links(opts.root);
+  if (stale.empty()) {
+    safePrintLn(wpm_text("command.wpm.status.links_verified",
+                         "wpm: every command link points at the installed "
+                         "winuxcmd.exe"));
+    return 0;
+  }
+  safeErrorPrintLn(wpm_text("command.wpm.error.links_stale",
+                            "wpm: {} command link(s) point at a different "
+                            "winuxcmd.exe:",
+                            stale.size()));
+  for (const auto& name : stale)
+    safeErrorPrintLn("  " + (canonical_bin_dir(opts.root) / exe_suffix(name)).string());
+  safeErrorPrintLn(
+      "wpm: 'wpm links rebuild --force' replaces them from the installed image");
+  return 1;
 }
 
 auto remove_links(const fs::path& root, bool dry_run) -> int {
@@ -3765,17 +3843,75 @@ auto install_from_manifest(const Options& opts, const std::string& from)
   return install_packages(opts, views);
 }
 
+/// Where the detached update helper writes what it did. Its output used to be
+/// discarded, which made every failure in the self-update path invisible -
+/// including the one that leaves a command link on the previous image
+/// (unixwin/WinuxCmd#1206).
+auto update_log_path(const fs::path& root) -> fs::path {
+  SYSTEMTIME now{};
+  GetLocalTime(&now);
+  char stamp[32];
+  std::snprintf(stamp, sizeof(stamp), "%04u%02u%02u-%02u%02u%02u",
+                now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                now.wSecond);
+  return state_dir(root) / "logs" /
+         ("self-update-" + std::string(stamp) + "-" +
+          std::to_string(GetCurrentProcessId()) + ".log");
+}
+
+/// Keep the newest few update logs; each one is small and they are only read
+/// when something went wrong.
+void prune_update_logs(const fs::path& root, size_t keep) {
+  std::error_code ec;
+  const fs::path dir = state_dir(root) / "logs";
+  std::vector<fs::path> logs;
+  for (const auto& entry : fs::directory_iterator(
+           dir, fs::directory_options::skip_permission_denied, ec)) {
+    const auto name = entry.path().filename().string();
+    if (name.rfind("self-update-", 0) == 0 && entry.path().extension() == ".log")
+      logs.push_back(entry.path());
+  }
+  if (logs.size() <= keep) return;
+  std::sort(logs.begin(), logs.end());  // timestamped names sort chronologically
+  for (size_t i = 0; i + keep < logs.size(); ++i) {
+    std::error_code remove_ec;
+    fs::remove(logs[i], remove_ec);
+  }
+}
+
 auto launch_apply_update(const fs::path& staged_exe, const fs::path& root,
                          DWORD parent_pid) -> bool {
   std::wstring cmd = quote(staged_exe) + L" wpm -- __apply-update --root " +
                      quote(root) + L" --payload " + quote(staged_exe) +
                      L" --parent " + std::to_wstring(parent_pid);
+
+  // Give the detached helper somewhere to speak: everything it prints - and
+  // anything it fails at - goes to this log instead of nowhere.
+  std::error_code log_ec;
+  const fs::path log = update_log_path(root);
+  fs::create_directories(log.parent_path(), log_ec);
+  SECURITY_ATTRIBUTES inherit{};
+  inherit.nLength = sizeof(inherit);
+  inherit.bInheritHandle = TRUE;
+  HANDLE log_handle =
+      CreateFileW(log.wstring().c_str(), FILE_APPEND_DATA,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, OPEN_ALWAYS,
+                  FILE_ATTRIBUTE_NORMAL, nullptr);
+
   STARTUPINFOW si{};
   si.cb = sizeof(si);
+  if (log_handle != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = log_handle;
+    si.hStdError = log_handle;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  }
   PROCESS_INFORMATION pi{};
   BOOL ok = CreateProcessW(staged_exe.wstring().c_str(), cmd.data(), nullptr,
-                           nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
-                           root.wstring().c_str(), &si, &pi);
+                           nullptr, log_handle != INVALID_HANDLE_VALUE ? TRUE : FALSE,
+                           CREATE_NO_WINDOW, nullptr, root.wstring().c_str(), &si,
+                           &pi);
+  if (log_handle != INVALID_HANDLE_VALUE) CloseHandle(log_handle);
   if (!ok) {
     safeErrorPrintLn("wpm: failed to launch update helper: " +
                      win32_error_text(GetLastError()));
@@ -3783,6 +3919,11 @@ auto launch_apply_update(const fs::path& staged_exe, const fs::path& root,
   }
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
+  prune_update_logs(root, 3);
+  if (log_handle != INVALID_HANDLE_VALUE) {
+    safePrintLn(wpm_text("command.wpm.status.update_log",
+                         "wpm: update helper log: {}", log.string()));
+  }
   return true;
 }
 
@@ -3883,6 +4024,32 @@ auto unique_update_backup_path(const fs::path& root) -> fs::path {
   return candidate;
 }
 
+/// Rebuild every command link onto the image that is now in place, then check
+/// that they all moved. A single name left behind runs the previous build
+/// forever, so the second attempt is deliberate and the residual names are
+/// reported (unixwin/WinuxCmd#1206). The output lands in the helper's log.
+auto finish_update(const fs::path& root) -> int {
+  int rc = rebuild_links(root, true, false, false);
+  auto stale = stale_command_links(root);
+  if (stale.empty()) return rc;
+  safeErrorPrintLn(wpm_text("command.wpm.status.links_retry",
+                            "wpm: {} command link(s) still point at the "
+                            "previous winuxcmd.exe; relinking once more",
+                            stale.size()));
+  rebuild_links(root, true, false, true);
+  stale = stale_command_links(root);
+  if (stale.empty()) return rc;
+  safeErrorPrintLn(wpm_text("command.wpm.error.links_left_stale",
+                            "wpm: update finished with {} command link(s) on "
+                            "the previous winuxcmd.exe:",
+                            stale.size()));
+  for (const auto& name : stale)
+    safeErrorPrintLn("  " + (canonical_bin_dir(root) / exe_suffix(name)).string());
+  safeErrorPrintLn(
+      "wpm: 'wpm links rebuild --force' retries them from the installed image");
+  return 1;
+}
+
 auto apply_update(std::span<const std::string_view> args) -> int {
   fs::path root = parse_hidden_value(args, "--root");
   fs::path payload = parse_hidden_value(args, "--payload");
@@ -3931,7 +4098,7 @@ auto apply_update(std::span<const std::string_view> args) -> int {
   } else if (delete_file_name(target)) {
     std::error_code rename_ec;
     fs::rename(staged_target, target, rename_ec);
-    if (!rename_ec) return rebuild_links(root, true, false, false);
+    if (!rename_ec) return finish_update(root);
     safeErrorPrintLn("wpm: failed to move the updated winuxcmd.exe into place: " +
                      rename_ec.message());
     // The old name is gone; put a usable image back before giving up.
@@ -3943,7 +4110,7 @@ auto apply_update(std::span<const std::string_view> args) -> int {
                        restore_ec.message());
     std::error_code cleanup_ec;
     fs::remove(staged_target, cleanup_ec);
-    rebuild_links(root, true, false, false);
+    finish_update(root);
     return 1;
   } else {
     std::error_code cleanup_ec;
@@ -3966,10 +4133,10 @@ auto apply_update(std::span<const std::string_view> args) -> int {
                          restore_ec.message());
       }
     }
-    rebuild_links(root, true, false, false);
+    finish_update(root);
     return 1;
   }
-  return rebuild_links(root, true, false, false);
+  return finish_update(root);
 }
 
 auto try_fetch_index(const Options& opts, std::string& used_source)
@@ -5154,9 +5321,10 @@ auto dispatch(const Options& opts, std::span<const std::string_view> args)
     if (args[1] == "remove") {
       return remove_links(opts.root, opts.dry_run);
     }
+    if (args[1] == "verify") return verify_links(opts);
     safeErrorPrintLn(
         winux::i18n::translate("command.wpm.error.usage.links",
-                               "wpm: usage: wpm links list|rebuild|remove"));
+                               "wpm: usage: wpm links list|rebuild|remove|verify"));
     return 1;
   }
 
