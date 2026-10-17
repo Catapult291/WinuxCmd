@@ -1789,6 +1789,31 @@ TEST(wpm, wpm_links_rebuild_names_a_link_it_cannot_replace) {
   EXPECT_FALSE(same_file(root_exe, stale));
 }
 
+TEST(wpm, wpm_clean_backup_removes_rollback_copies) {
+  TempDir tmp;
+  tmp.write(".wpm/backup/winuxcmd-before-update-111.exe", "old image\n");
+  tmp.write(".wpm/backup/winuxcmd-before-update-222.exe", "older image\n");
+  tmp.write(".wpm/indexes/official.json", "index\n");
+
+  Pipeline backup;
+  backup.add(L"winuxcmd.exe",
+             {L"wpm", L"clean", L"backup", L"--root", tmp.wpath()});
+  auto r = backup.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L".wpm" / L"backup" /
+                                       L"winuxcmd-before-update-111.exe"));
+  EXPECT_TRUE(std::filesystem::exists(tmp.path / L".wpm" / L"indexes" /
+                                      L"official.json"));
+
+  // `clean all` reclaims the rollback copies too (#1208).
+  tmp.write(".wpm/backup/winuxcmd-before-update-333.exe", "another\n");
+  Pipeline all;
+  all.add(L"winuxcmd.exe", {L"wpm", L"clean", L"all", L"--root", tmp.wpath()});
+  EXPECT_EQ(all.run().exit_code, 0);
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L".wpm" / L"backup"));
+}
+
 TEST(wpm, wpm_outdated_uses_receipt_version_after_index_update) {
   TempDir tmp;
   const auto artifact_path = tmp.path / L"source" / L"jq.exe";

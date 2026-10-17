@@ -1150,6 +1150,11 @@ auto clean_state(const Options& opts, std::string_view selection) -> int {
     result = clean_state_directory(opts.root, "staging", opts.dry_run,
                                    opts.verbose);
     if (result != 0) return result;
+    // Rollback copies are the third thing that grows without bound, and
+    // `clean all` is what a user types when reclaiming space.
+    result =
+        clean_state_directory(opts.root, "backup", opts.dry_run, opts.verbose);
+    if (result != 0) return result;
     return clean_replaced_leftovers(opts);
   }
   if (kind == "cache")
@@ -1160,9 +1165,11 @@ auto clean_state(const Options& opts, std::string_view selection) -> int {
     if (result != 0) return result;
     return clean_replaced_leftovers(opts);
   }
+  if (kind == "backup")
+    return clean_state_directory(opts.root, kind, opts.dry_run, opts.verbose);
   safeErrorPrintLn(
       winux::i18n::translate("command.wpm.error.usage.clean",
-                             "wpm: usage: wpm clean [cache|staging|all]"));
+                             "wpm: usage: wpm clean [cache|staging|backup|all]"));
   return 1;
 }
 
@@ -4011,6 +4018,30 @@ auto parse_hidden_value(std::span<const std::string_view> args,
   return {};
 }
 
+/// Keep the newest few rollback copies. Every update writes one and nothing
+/// ever pruned them, so a machine that has taken a handful of updates carries
+/// every image it ever ran (unixwin/WinuxCmd#1208). The names carry a pid, not
+/// a timestamp, so order by write time.
+void prune_update_backups(const fs::path& root, size_t keep) {
+  std::error_code ec;
+  std::vector<std::pair<fs::file_time_type, fs::path>> backups;
+  for (const auto& entry : fs::directory_iterator(
+           backup_dir(root), fs::directory_options::skip_permission_denied, ec)) {
+    const auto name = entry.path().filename().string();
+    if (name.rfind("winuxcmd-before-update-", 0) != 0) continue;
+    std::error_code time_ec;
+    const auto written = fs::last_write_time(entry.path(), time_ec);
+    if (time_ec) continue;
+    backups.emplace_back(written, entry.path());
+  }
+  if (backups.size() <= keep) return;
+  std::sort(backups.begin(), backups.end());
+  for (size_t i = 0; i + keep < backups.size(); ++i) {
+    std::error_code remove_ec;
+    fs::remove(backups[i].second, remove_ec);  // best effort: a held image stays
+  }
+}
+
 auto unique_update_backup_path(const fs::path& root) -> fs::path {
   fs::path dir = backup_dir(root);
   std::string stem =
@@ -4068,6 +4099,7 @@ auto apply_update(std::span<const std::string_view> args) -> int {
 
   std::error_code ec;
   fs::create_directories(backup_dir(root), ec);
+  prune_update_backups(root, 2);
   fs::path target = canonical_winuxcmd_path(root);
   fs::path backup = unique_update_backup_path(root);
   if (fs::exists(target, ec)) {

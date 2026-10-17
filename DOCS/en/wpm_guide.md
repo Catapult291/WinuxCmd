@@ -265,16 +265,21 @@ wpm links rebuild    # Recreate all hardlinks for registered commands
 wpm links remove     # Remove all command links
 ```
 
-### 4.15 `wpm clean [cache|staging|all]`
+### 4.15 `wpm clean [cache|staging|backup|all]`
 
 Remove transient state directories.
 
 ```bash
-wpm clean            # Clean both cache and staging
+wpm clean            # Everything below
 wpm clean cache      # Clean only download cache
 wpm clean staging    # Clean only extraction staging
+wpm clean backup     # Rollback copies of winuxcmd.exe
 wpm cache clean      # Alias
 ```
+
+The self-update writes one `winuxcmd.exe` rollback copy per run into
+`.wpm/backup/`; the newest two are kept and older ones are pruned automatically
+when the next update runs.
 
 ### 4.16 `wpm version`
 
