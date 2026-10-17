@@ -590,6 +590,10 @@ auto materialize_command_link(const fs::path& source, const fs::path& target)
   return ec;
 }
 
+/// Defined with the package-upgrade path below; the command-link rebuild needs
+/// it too, to park a stale name it cannot delete.
+auto move_aside(const fs::path& target, fs::path* parked_out) -> bool;
+
 auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
     -> int {
   const fs::path canonical_source = canonical_winuxcmd_path(root);
@@ -620,6 +624,29 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
       continue;
     }
     if (!remove_link_if_safe(source, target, current, force, dry_run)) {
+      // A stale name that cannot be deleted - a process still holding it, or a
+      // name some other tool created - must not leave this command on the
+      // previous image. Park it and link the new one over the freed name, the
+      // same way a package upgrade replaces a held payload file
+      // (unixwin/WinuxCmd#1194); if even the rename is refused, say which name
+      // it was instead of leaving a bare count behind.
+      fs::path parked;
+      if (!dry_run && move_aside(target, &parked)) {
+        auto relink_error = materialize_command_link(source, target);
+        if (!relink_error) {
+          std::error_code parked_ec;
+          fs::remove(parked, parked_ec);
+          ++created;
+          if (verbose)
+            safePrintLn("wpm: relinked " + target.string() +
+                        " (parked the previous name)");
+          continue;
+        }
+        std::error_code restore_ec;
+        fs::rename(parked, target, restore_ec);
+      }
+      safeErrorPrintLn("wpm: failed to replace the command link '" +
+                       target.string() + "'");
       ++failed;
       continue;
     }
@@ -643,6 +670,10 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
       safeErrorPrintLn(wpm_text("command.wpm.error.create_link",
                                 "wpm: failed to create hard link '{}': {}",
                                 target.string(), link_error.message()));
+      // Say what the consequence is: this name keeps running the previous
+      // image until something relinks it.
+      safeErrorPrintLn("wpm: '" + target.string() +
+                       "' still points at the previous winuxcmd.exe");
       ++failed;
     }
   }

@@ -1712,6 +1712,44 @@ TEST(wpm, wpm_install_replaces_a_destination_a_process_runs_from) {
   EXPECT_NOT_CONTAINS(cleaned.stderr_text, "failed to clean");
 }
 
+TEST(wpm, wpm_links_rebuild_names_a_link_it_cannot_replace) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+
+  // A stale command link: `yes.exe` points at a different image (exactly what
+  // an interrupted update leaves behind).
+  const auto stale_source = tmp.path / L"previous-image.exe";
+  tmp.write("previous-image.exe", "previous winuxcmd image\n");
+  const auto stale = tmp.path / L"usr" / L"bin" / L"yes.exe";
+  ASSERT_TRUE(CreateHardLinkW(stale.wstring().c_str(),
+                              stale_source.wstring().c_str(), nullptr) != 0);
+
+  // Hold it without FILE_SHARE_DELETE, so neither deleting nor renaming the
+  // name is possible: the rebuild must say *which* link it could not replace
+  // instead of leaving a bare count behind (#1206).
+  HANDLE hold =
+      CreateFileW(stale.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_TRUE(hold != INVALID_HANDLE_VALUE);
+  if (hold == INVALID_HANDLE_VALUE) return;
+
+  Pipeline rebuild;
+  rebuild.add(L"winuxcmd.exe", {L"wpm", L"links", L"rebuild", L"--force",
+                                L"--root", tmp.wpath()});
+  auto r = rebuild.run();
+  CloseHandle(hold);
+
+  EXPECT_NE(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stderr_text, "yes.exe");
+  EXPECT_CONTAINS(r.stderr_text, "failed to replace the command link");
+  // Every other name still resolves to the current image.
+  EXPECT_TRUE(same_file(root_exe, tmp.path / L"usr" / L"bin" / L"ls.exe"));
+  EXPECT_FALSE(same_file(root_exe, stale));
+}
+
 TEST(wpm, wpm_outdated_uses_receipt_version_after_index_update) {
   TempDir tmp;
   const auto artifact_path = tmp.path / L"source" / L"jq.exe";
