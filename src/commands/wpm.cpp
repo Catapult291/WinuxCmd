@@ -274,6 +274,83 @@ auto write_text(const fs::path& path, std::string_view text) -> bool {
   return out.good();
 }
 
+/// The package-shim forwarder (`winuxcmd-shim.exe`) reads its payload from
+/// this map: one line per command, `<command>=<payload relative to the
+/// installation root>`. Shims used to be hardlinks to winuxcmd.exe, which spent
+/// a whole WinuxCmd startup dispatching to `opt\<pkg>\<command>.exe`
+/// (unixwin/WinuxCmd#1207).
+auto shim_map_path(const fs::path& root) -> fs::path {
+  return state_dir(root) / "shims.map";
+}
+
+auto read_shim_map(const fs::path& root)
+    -> std::vector<std::pair<std::string, std::string>> {
+  std::vector<std::pair<std::string, std::string>> entries;
+  auto text = read_text(shim_map_path(root));
+  if (!text) return entries;
+  const std::string_view view(*text);
+  size_t position = 0;
+  while (position <= view.size()) {
+    const size_t end = view.find('\n', position);
+    std::string_view line = view.substr(
+        position, end == std::string_view::npos ? std::string_view::npos
+                                                : end - position);
+    position = end == std::string_view::npos ? view.size() + 1 : end + 1;
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                             line.back() == '\t'))
+      line.remove_suffix(1);
+    if (line.empty() || line.front() == '#') continue;
+    const auto equals = line.find('=');
+    if (equals == std::string_view::npos || equals == 0) continue;
+    entries.emplace_back(std::string(line.substr(0, equals)),
+                         std::string(line.substr(equals + 1)));
+  }
+  return entries;
+}
+
+auto write_shim_map(const fs::path& root,
+                    const std::vector<std::pair<std::string, std::string>>& entries)
+    -> bool {
+  std::string text =
+      "# Package shim payloads, maintained by wpm: <command>=<payload> where the\n"
+      "# payload is relative to this installation root.\n";
+  for (const auto& [command, payload] : entries)
+    text += command + "=" + payload + "\n";
+  return write_text(shim_map_path(root), text);
+}
+
+auto set_shim_map_entry(const fs::path& root, const std::string& command,
+                        const std::string& payload) -> bool {
+  auto entries = read_shim_map(root);
+  for (auto& [name, target] : entries) {
+    if (name != command) continue;
+    if (target == payload) return true;  // already correct
+    target = payload;
+    return write_shim_map(root, entries);
+  }
+  entries.emplace_back(command, payload);
+  return write_shim_map(root, entries);
+}
+
+/// Drop the map entries of these commands (uninstall path).
+void remove_shim_map_entries(const fs::path& root,
+                             const std::vector<std::string>& commands) {
+  auto entries = read_shim_map(root);
+  const size_t before = entries.size();
+  std::erase_if(entries, [&](const auto& entry) {
+    return std::ranges::find(commands, entry.first) != commands.end();
+  });
+  if (entries.size() != before) write_shim_map(root, entries);
+}
+
+/// The forwarder that replaced "spend a winuxcmd startup to spawn the payload",
+/// when this installation has it.
+auto package_shim_source(const fs::path& root) -> fs::path {
+  const fs::path forwarder = canonical_bin_dir(root) / "winuxcmd-shim.exe";
+  std::error_code ec;
+  return fs::is_regular_file(forwarder, ec) ? forwarder : fs::path{};
+}
+
 auto write_bytes(const fs::path& path, std::span<const std::byte> data)
     -> bool {
   std::error_code ec;
@@ -675,6 +752,38 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
       safeErrorPrintLn("wpm: '" + target.string() +
                        "' still points at the previous winuxcmd.exe");
       ++failed;
+    }
+  }
+
+  // Package shims live in the same directory and point at the forwarder when it
+  // is present. Refreshing them here means an update brings the cheaper
+  // dispatch to an existing installation without reinstalling every package
+  // (unixwin/WinuxCmd#1207), and that a stale one heals with the rest.
+  const fs::path forwarder = package_shim_source(root);
+  if (!forwarder.empty() && !dry_run) {
+    for (const auto& [command, payload] : read_shim_map(root)) {
+      const fs::path target = canonical_bin_dir(root) / exe_suffix(command);
+      std::error_code payload_ec;
+      if (!fs::is_regular_file(root / payload, payload_ec)) continue;
+      if (same_file(forwarder, target)) {
+        ++unchanged;
+        continue;
+      }
+      if (!remove_link_if_safe(forwarder, target, current, force, dry_run)) {
+        safeErrorPrintLn(
+            "wpm: failed to replace the package shim '" + target.string() + "'");
+        ++failed;
+        continue;
+      }
+      auto link_error = materialize_command_link(forwarder, target);
+      if (!link_error) {
+        ++created;
+        if (verbose) safePrintLn("wpm: relinked " + target.string());
+      } else {
+        safeErrorPrintLn("wpm: failed to link the package shim '" +
+                         target.string() + "': " + link_error.message());
+        ++failed;
+      }
     }
   }
 
@@ -2962,6 +3071,12 @@ auto create_package_shims(const fs::path& root, const nlohmann::json& pkg,
   }
 
   fs::path bin_dir = canonical_bin_dir(root);
+  // A `layout: shim` command is a link to the forwarder when this installation
+  // has one; the forwarder reads the payload path from the map instead of being
+  // a whole dispatcher (unixwin/WinuxCmd#1207). Installations without it keep
+  // the previous behaviour, so nothing breaks on an older root.
+  const fs::path forwarder = package_shim_source(root);
+  const fs::path shim_source = forwarder.empty() ? self_exe : forwarder;
   int created = 0;
   int unchanged = 0;
   for (const auto& item : pkg["commands"]) {
@@ -2970,7 +3085,7 @@ auto create_package_shims(const fs::path& root, const nlohmann::json& pkg,
     fs::path shim = bin_dir / (command + ".exe");
     ec.clear();
     if (fs::exists(shim, ec)) {
-      if (same_file(self_exe, shim) || files_equal(self_exe, shim)) {
+      if (same_file(shim_source, shim) || files_equal(shim_source, shim)) {
         ++unchanged;
         continue;
       }
@@ -2982,12 +3097,27 @@ auto create_package_shims(const fs::path& root, const nlohmann::json& pkg,
     }
     fs::create_directories(bin_dir, ec);
     // Hardlink-first keeps usr\bin uniform: every entry links exactly one
-    // canonical file (builtins and shims alike -> winuxcmd.exe).
-    if (!materialize_file(self_exe, shim, true, ec)) {
+    // canonical file (builtins -> winuxcmd.exe, package shims -> the forwarder).
+    if (!materialize_file(shim_source, shim, true, ec)) {
       safeErrorPrintLn(wpm_text("command.wpm.error.shim_create",
                                 "wpm: failed to create shim '{}': {}",
                                 shim.string(), ec.message()));
       return false;
+    }
+    if (!forwarder.empty()) {
+      // Point the forwarder at this package's payload for this command.
+      const fs::path payload =
+          package_payload_dir(root, package) / exe_suffix(command);
+      if (fs::is_regular_file(payload, ec)) {
+        const fs::path relative = fs::relative(payload, root, ec);
+        if (!ec && set_shim_map_entry(root, command, relative.string()) == false) {
+          safeErrorPrintLn(wpm_text("command.wpm.error.shim_map",
+                                    "wpm: failed to record the payload for "
+                                    "'{}' in {}",
+                                    command, shim_map_path(root).string()));
+          return false;
+        }
+      }
     }
     ++created;
   }

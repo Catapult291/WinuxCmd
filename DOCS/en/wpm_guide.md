@@ -490,7 +490,7 @@ WPM automatically detects the CPU architecture:
 | Layout | Behavior |
 |---|---|
 | `flat` (default) | Files are placed directly into `usr/bin/`. |
-| `shim` | Payload goes to `<root>/opt/<pkg>/`; command shims (hardlinks of `winuxcmd.exe`) are created in `usr/bin/`. The dispatcher routes to the actual payload. |
+| `shim` | Payload goes to `<root>/opt/<pkg>/`; each command becomes a link in `usr/bin/` that runs the payload. When the installation carries `winuxcmd-shim.exe` the link points at that small forwarder, which reads the payload path from `.wpm/shims.map`; otherwise the link is a hardlink of `winuxcmd.exe` and the dispatcher routes to the payload. The payload keeps its private DLLs out of `%PATH%` either way. |
 
 Choose `shim` whenever the payload carries its own DLLs (OpenSSH's `libcrypto.dll`) or ships several files: it keeps everything out of `usr/bin/`, which sits on `%PATH%`. Choose `flat` when the binary itself is what users and tools should resolve.
 
