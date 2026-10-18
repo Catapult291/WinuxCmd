@@ -369,6 +369,42 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
       normalized = L"/" + normalized.substr(drive_pos);
     }
   }
+  // WSL interop drive prefix: /mnt/X/... names the same file as /X/... and
+  // X:\... (#1172). WSL mounts the Windows drives under /mnt, so its spelling
+  // reaches argv verbatim whenever a WSL-side toolchain (or a script quoting
+  // WSL paths) hands this binary the operand directly - outside rubash, whose
+  // argv funnel already pre-translates the form for every child (rubash#444,
+  // rubash#592). Folding it to the MSYS spelling, like the cygdrive fold
+  // above, keeps the single drive-letter branch below owning every POSIX
+  // drive form. The prefix matches rubash's windows_mnt_drive_argument
+  // byte-for-byte so the two layers never drift: a lowercase "mnt" literal
+  // (the spelling WSL itself emits - unlike cygdrive, the name comparison is
+  // case-sensitive by contract), the literal separator after it, a drive
+  // letter of either case, and exactly /mnt/X or /mnt/X/...: "/mnt/data",
+  // "/mnt/cfoo" and "/mnt/123" are ordinary POSIX words under a literal /mnt
+  // directory, bare /mnt (the WSL root) is never a drive, and without the
+  // separator check "/mntcc" would lexically fold to "/c" and name C:\.
+  constexpr std::wstring_view k_mnt_name = L"mnt";
+  if (normalized.size() >= k_mnt_name.size() + 3 &&
+      is_separator(normalized[0])) {
+    bool name_match = true;
+    for (size_t i = 0; i < k_mnt_name.size(); ++i) {
+      if (normalized[1 + i] != k_mnt_name[i]) {
+        name_match = false;
+        break;
+      }
+    }
+    const size_t drive_pos = k_mnt_name.size() + 2;
+    const wchar_t drive_ch = normalized[drive_pos];
+    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
+                              (drive_ch >= L'A' && drive_ch <= L'Z');
+    if (name_match && is_separator(normalized[k_mnt_name.size() + 1]) &&
+        drive_letter &&
+        (normalized.size() == drive_pos + 1 ||
+         is_separator(normalized[drive_pos + 1]))) {
+      normalized = L"/" + normalized.substr(drive_pos);
+    }
+  }
   if (normalized.size() >= 2 && is_separator(normalized[0]) &&
       ((normalized[1] >= L'a' && normalized[1] <= L'z') ||
        (normalized[1] >= L'A' && normalized[1] <= L'Z')) &&
