@@ -4,6 +4,28 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Added
+
+- **native path**: `/mnt/X/...` operands resolve like `/X/...` and `X:\...` -
+  the WSL interop spelling (#1172). WSL mounts the Windows drives under
+  `/mnt`, and that spelling reached argv verbatim whenever a tool was invoked
+  directly (PowerShell, cmd, a scheduler, an agent) rather than through
+  rubash, whose argv funnel already pre-translates the form for every child
+  (rubash#444, rubash#592). `normalize_api_operand_w` now folds `/mnt/X` to
+  the MSYS `/X` spelling before the drive branch, so a single drive-letter
+  arm keeps owning every POSIX drive form. The accepted shape matches
+  rubash's `windows_mnt_drive_argument` byte-for-byte: a lowercase `mnt`
+  literal, a drive letter of either case, exactly `/mnt/X` or `/mnt/X/...`.
+  Bare `/mnt` (the WSL root) and non-drive children (`/mnt/data`,
+  `/mnt/cfoo`, `/mnt/123`) stay verbatim, `/mnt/cygdrive/d` cannot fold
+  twice, and the existing verbatim classes (`/cygdrive/*`, `/dev/*`, bare
+  `/`, `/X...` switches) are untouched. Every tool on the shared operand
+  boundary (ls, du, sed, cp, ...) picks the form up at once; under a
+  configured shell root the resolution is unchanged, since the niubash#346
+  shell-ns arm already mapped this exact shape.
+
 ## [1.1.14] - 2026-10-17
 
 ### Added

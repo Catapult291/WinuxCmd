@@ -3288,6 +3288,18 @@ auto ls_cygdrive_form(const std::filesystem::path& path) -> std::wstring {
   return L"/cygdrive/" + drive + text.substr(2);
 }
 
+// C:/a/b -> /mnt/c/a/b (WSL interop drive dialect, #1172). The drive letter
+// case follows WSL practice (lowercase as WSL emits it, uppercase accepted).
+auto ls_mnt_form(const std::filesystem::path& path, bool upper_drive)
+    -> std::wstring {
+  std::wstring text = path.generic_wstring();
+  std::wstring drive = text.substr(0, 1);
+  drive[0] = static_cast<wchar_t>(
+      upper_drive ? std::toupper(static_cast<unsigned char>(drive[0]))
+                  : std::tolower(static_cast<unsigned char>(drive[0])));
+  return L"/mnt/" + drive + text.substr(2);
+}
+
 // UTF-8 spelling of a wide dialect operand (ls writes stdout as UTF-8).
 auto ls_utf8(const std::wstring& text) -> std::string {
   if (text.empty()) return {};
@@ -3368,4 +3380,128 @@ TEST(ls, ls_root_operand_lists_current_drive_root) {
 
   EXPECT_EQ(r2.exit_code, 0);
   EXPECT_EQ_TEXT(r2.stdout_text, "/\n");
+}
+
+// [#1172] WSL interop drive dialect: /mnt/<drive>/... names the same file as
+// /<drive>/... and <Drive>:\... (WSL mounts the Windows drives under /mnt),
+// and a bare /mnt/<drive> names the drive root. Standalone - no shell root
+// configured - the operand used to fail with ENOENT: the only /mnt/X
+// resolver was the shell-ns arm (niubash#346), which stays inert unless a
+// shell root is set. The operand echoes exactly as typed, like the /c/ and
+// /cygdrive/c/ dialects above.
+TEST(ls, ls_mnt_drive_dialect_resolves) {
+  for (const bool upper_drive : {false, true}) {
+    TempDir tmp;
+    tmp.write("f.txt", "x");
+    const std::wstring file_operand =
+        ls_mnt_form(tmp.path / "f.txt", upper_drive);
+    const std::wstring dir_operand = ls_mnt_form(tmp.path, upper_drive);
+    const std::wstring bare_drive = L"/mnt/" + dir_operand.substr(5, 1);
+
+    for (const bool dash_d : {false, true}) {
+      const std::wstring& operand = dash_d ? dir_operand : file_operand;
+      Pipeline p;
+      p.set_cwd(tmp.wpath());
+      for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                               L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+        p.set_env(name, L"");
+      }
+      if (dash_d) {
+        p.add(L"ls.exe", {L"-d", operand});
+      } else {
+        p.add(L"ls.exe", {operand});
+      }
+      auto r = p.run();
+
+      EXPECT_EQ(r.exit_code, 0);
+      EXPECT_EQ_TEXT(r.stdout_text, ls_utf8(operand) + "\n");
+      EXPECT_EQ_TEXT(r.stderr_text, "");
+    }
+
+    Pipeline p2;
+    p2.set_cwd(tmp.wpath());
+    for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                             L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+      p2.set_env(name, L"");
+    }
+    p2.add(L"ls.exe", {L"-d", bare_drive});
+    auto r2 = p2.run();
+
+    EXPECT_EQ(r2.exit_code, 0);
+    EXPECT_EQ_TEXT(r2.stdout_text, ls_utf8(bare_drive) + "\n");
+    EXPECT_EQ_TEXT(r2.stderr_text, "");
+  }
+}
+
+// [#1172] The fold is exactly /mnt/X or /mnt/X/... with an alphabetic X:
+// the WSL root itself (/mnt, /mnt/) and non-drive children (/mnt/data,
+// /mnt/cfoo, /mnt/123) stay verbatim, and /mnt/cygdrive/<drive>/... must
+// not fold twice - a double fold would land the as-spelled-missing operand
+// on the real drive path and succeed, while verbatim it fails ENOENT with
+// the operand echoed (the load-bearing negative for boundary (d)).
+TEST(ls, ls_mnt_non_drive_forms_stay_verbatim) {
+  TempDir tmp;
+  tmp.write("f.txt", "x");
+  const std::wstring text = tmp.path.generic_wstring();
+  const std::wstring drive(
+      1,
+      static_cast<wchar_t>(std::tolower(static_cast<unsigned char>(text[0]))));
+  const std::wstring double_fold_guard =
+      L"/mnt/cygdrive/" + drive + text.substr(2);
+  const std::wstring forms[] = {L"/mnt",      L"/mnt/",    L"/mnt/data",
+                                L"/mnt/cfoo", L"/mnt/123", double_fold_guard};
+  for (const auto& form : forms) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    for (const auto* name : {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT",
+                             L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+      p.set_env(name, L"");
+    }
+    p.add(L"ls.exe", {form});
+    auto r = p.run();
+
+    EXPECT_EQ(r.exit_code, 2);
+    EXPECT_TRUE(r.stdout_text.empty());
+    EXPECT_NE(r.stderr_text.find(ls_utf8(form)), std::string::npos);
+  }
+}
+
+// [#1172] With a shell root configured (niubash#346) the same shapes keep
+// working: the WSL drive form resolves through the new fold to the same
+// target the shell-ns /mnt arm used to produce, while bare /mnt keeps the
+// shell-tree mount semantics (<root>/mnt) - the fold must not swallow the
+// mount name.
+TEST(ls, ls_mnt_forms_keep_shell_root_semantics) {
+  TempDir root;
+  TempDir cwd;
+  TempDir files;
+  files.write("f.txt", "x");
+  root.write("mnt/marker.txt", "m");
+
+  const std::wstring form = ls_mnt_form(files.path / "f.txt", false);
+  Pipeline drive_pipeline;
+  drive_pipeline.set_cwd(cwd.wpath());
+  drive_pipeline.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+  drive_pipeline.set_env(L"NIU_ROOT", L"");
+  drive_pipeline.set_env(L"WINUXSH_ROOT", L"");
+  drive_pipeline.set_env(L"RUBASH_ROOT", L"");
+  drive_pipeline.add(L"ls.exe", {form});
+  auto drive_result = drive_pipeline.run();
+
+  EXPECT_EQ(drive_result.exit_code, 0);
+  EXPECT_EQ_TEXT(drive_result.stdout_text, ls_utf8(form) + "\n");
+  EXPECT_EQ_TEXT(drive_result.stderr_text, "");
+
+  Pipeline mount_pipeline;
+  mount_pipeline.set_cwd(cwd.wpath());
+  mount_pipeline.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+  mount_pipeline.set_env(L"NIU_ROOT", L"");
+  mount_pipeline.set_env(L"WINUXSH_ROOT", L"");
+  mount_pipeline.set_env(L"RUBASH_ROOT", L"");
+  mount_pipeline.add(L"ls.exe", {L"-1", L"/mnt"});
+  auto mount_result = mount_pipeline.run();
+
+  EXPECT_EQ(mount_result.exit_code, 0);
+  EXPECT_EQ_TEXT(mount_result.stdout_text, "marker.txt\n");
+  EXPECT_EQ_TEXT(mount_result.stderr_text, "");
 }
