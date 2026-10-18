@@ -671,6 +671,70 @@ auto materialize_command_link(const fs::path& source, const fs::path& target)
 /// it too, to park a stale name it cannot delete.
 auto move_aside(const fs::path& target, fs::path* parked_out) -> bool;
 
+/// Defined with the install-receipt helpers below; the command-link rebuild
+/// walks the receipts to find shim packages the map does not know yet.
+auto receipts_dir(const fs::path& root) -> fs::path;
+
+/// Commands of installed `layout: shim` packages that the map does not know
+/// yet. An installation that received the forwarder through a self-update has
+/// receipts and payloads but no `.wpm/shims.map`, and its shims are still
+/// links of winuxcmd.exe; these entries are what that migration records
+/// (unixwin/WinuxCmd#1207).
+auto missing_shim_map_entries(
+    const fs::path& root,
+    const std::vector<std::pair<std::string, std::string>>& entries)
+    -> std::vector<std::pair<std::string, std::string>> {
+  std::vector<std::pair<std::string, std::string>> missing;
+  // First pass over the receipts alone: an installation without shim packages
+  // pays only a directory listing, never the index parse.
+  std::vector<std::string> shim_packages;
+  std::error_code ec;
+  for (const auto& item :
+       fs::directory_iterator(receipts_dir(root),
+                              fs::directory_options::skip_permission_denied,
+                              ec)) {
+    if (ec) break;
+    std::error_code file_ec;
+    if (!item.is_regular_file(file_ec) || file_ec) continue;
+    if (item.path().extension() != ".json") continue;
+    auto text = read_text(item.path());
+    if (!text) continue;
+    auto receipt = parse_json_text(*text);
+    if (!receipt || !receipt->is_object()) continue;
+    if (receipt->value("layout", "") != "shim") continue;
+    const std::string package = receipt->value("name", "");
+    if (!package.empty()) shim_packages.push_back(package);
+  }
+  if (shim_packages.empty()) return missing;
+
+  const auto index = load_index(root);
+  for (const auto& package : shim_packages) {
+    const auto pkg = find_package(index, package);
+    if (!pkg || !(*pkg).contains("commands") ||
+        !(*pkg)["commands"].is_array())
+      continue;
+    for (const auto& command_json : (*pkg)["commands"]) {
+      if (!command_json.is_string()) continue;
+      const std::string command = command_json.get<std::string>();
+      const bool known =
+          std::ranges::any_of(entries, [&](const auto& entry) {
+            return entry.first == command;
+          }) || std::ranges::any_of(missing, [&](const auto& entry) {
+            return entry.first == command;
+          });
+      if (known) continue;
+      const fs::path payload =
+          package_payload_dir(root, package) / exe_suffix(command);
+      std::error_code payload_ec;
+      if (!fs::is_regular_file(payload, payload_ec)) continue;
+      const fs::path relative = fs::relative(payload, root, ec);
+      if (ec) continue;
+      missing.emplace_back(command, relative.string());
+    }
+  }
+  return missing;
+}
+
 auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
     -> int {
   const fs::path canonical_source = canonical_winuxcmd_path(root);
@@ -761,7 +825,23 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
   // (unixwin/WinuxCmd#1207), and that a stale one heals with the rest.
   const fs::path forwarder = package_shim_source(root);
   if (!forwarder.empty() && !dry_run) {
-    for (const auto& [command, payload] : read_shim_map(root)) {
+    auto entries = read_shim_map(root);
+    // An installation that received the forwarder through a self-update has
+    // receipts and payloads but no map yet, and its shims are still links of
+    // winuxcmd.exe. Record those payloads so the same pass that relinks the
+    // builtins migrates the package shims too; activation runs this rebuild at
+    // every shell start, so the migration is one shell start away.
+    const auto missing = missing_shim_map_entries(root, entries);
+    if (!missing.empty()) {
+      for (const auto& [command, payload] : missing) {
+        if (verbose)
+          safePrintLn("wpm: registered the payload for '" + command + "' in " +
+                      shim_map_path(root).string());
+      }
+      entries.insert(entries.end(), missing.begin(), missing.end());
+      write_shim_map(root, entries);
+    }
+    for (const auto& [command, payload] : entries) {
       const fs::path target = canonical_bin_dir(root) / exe_suffix(command);
       std::error_code payload_ec;
       if (!fs::is_regular_file(root / payload, payload_ec)) continue;
@@ -770,8 +850,26 @@ auto rebuild_links(const fs::path& root, bool force, bool dry_run, bool verbose)
         continue;
       }
       if (!remove_link_if_safe(forwarder, target, current, force, dry_run)) {
-        safeErrorPrintLn(
-            "wpm: failed to replace the package shim '" + target.string() + "'");
+        // Same contract as the builtin links above: a stale name that cannot
+        // be deleted is parked and the forwarder linked over the freed name,
+        // so one held shim cannot keep its package on the old dispatcher.
+        fs::path parked;
+        if (move_aside(target, &parked)) {
+          auto relink_error = materialize_command_link(forwarder, target);
+          if (!relink_error) {
+            std::error_code parked_ec;
+            fs::remove(parked, parked_ec);
+            ++created;
+            if (verbose)
+              safePrintLn("wpm: relinked " + target.string() +
+                          " (parked the previous name)");
+            continue;
+          }
+          std::error_code restore_ec;
+          fs::rename(parked, target, restore_ec);
+        }
+        safeErrorPrintLn("wpm: failed to replace the package shim '" +
+                         target.string() + "'");
         ++failed;
         continue;
       }
@@ -4017,10 +4115,14 @@ void prune_update_logs(const fs::path& root, size_t keep) {
 }
 
 auto launch_apply_update(const fs::path& staged_exe, const fs::path& root,
-                         DWORD parent_pid) -> bool {
+                         DWORD parent_pid,
+                         const std::optional<fs::path>& staged_forwarder)
+    -> bool {
   std::wstring cmd = quote(staged_exe) + L" wpm -- __apply-update --root " +
                      quote(root) + L" --payload " + quote(staged_exe) +
                      L" --parent " + std::to_wstring(parent_pid);
+  if (staged_forwarder)
+    cmd += L" --forwarder " + quote(*staged_forwarder);
 
   // Give the detached helper somewhere to speak: everything it prints - and
   // anything it fails at - goes to this log instead of nowhere.
@@ -4124,6 +4226,14 @@ auto update_winuxcmd(const Options& opts) -> int {
     return 1;
   }
 
+  // The release carries the package-shim forwarder next to the image (the
+  // install rules put both into usr/bin). The index `files` mapping may not
+  // list it yet, so self-update stages it explicitly: without this, an updated
+  // installation keeps paying the old winuxcmd dispatcher for every
+  // `layout: shim` command (unixwin/WinuxCmd#1207).
+  const auto staged_forwarder =
+      find_file_recursive(extracted, "winuxcmd-shim.exe");
+
   if (opts.dry_run) {
     safePrintLn(wpm_text("command.wpm.status.update_dry_run",
                          "wpm: dry-run: would apply update from {}",
@@ -4131,7 +4241,8 @@ auto update_winuxcmd(const Options& opts) -> int {
     return 0;
   }
 
-  if (!launch_apply_update(*staged_exe, opts.root, GetCurrentProcessId())) {
+  if (!launch_apply_update(*staged_exe, opts.root, GetCurrentProcessId(),
+                           staged_forwarder)) {
     return 1;
   }
   safePrintLn(wpm_text("command.wpm.status.update_staged",
@@ -4215,6 +4326,7 @@ auto apply_update(std::span<const std::string_view> args) -> int {
   fs::path root = parse_hidden_value(args, "--root");
   fs::path payload = parse_hidden_value(args, "--payload");
   std::string parent_text = parse_hidden_value(args, "--parent");
+  fs::path forwarder = parse_hidden_value(args, "--forwarder");
   if (root.empty() || payload.empty() || parent_text.empty()) {
     safeErrorPrintLn("wpm: invalid apply-update invocation");
     return 1;
@@ -4226,6 +4338,35 @@ auto apply_update(std::span<const std::string_view> args) -> int {
     WaitForSingleObject(parent, 30000);
     CloseHandle(parent);
   }
+
+  // Land the staged package-shim forwarder in usr\bin before the links are
+  // rebuilt: the rebuild is what points `layout: shim` commands at it, so the
+  // image swap alone would leave every shim on the old dispatcher
+  // (unixwin/WinuxCmd#1207). Best effort - a failure here is reported, but the
+  // image update itself still stands.
+  auto install_forwarder = [&]() {
+    std::error_code forwarder_ec;
+    if (forwarder.empty() ||
+        !fs::is_regular_file(forwarder, forwarder_ec) || forwarder_ec)
+      return;
+    const fs::path destination = canonical_bin_dir(root) / "winuxcmd-shim.exe";
+    if (fs::exists(destination, forwarder_ec) &&
+        files_equal(forwarder, destination))
+      return;
+    // The shim may be mid-run somewhere; unlink the name first, like the image
+    // swap does, instead of writing over it.
+    if (fs::exists(destination, forwarder_ec)) delete_file_name(destination);
+    fs::create_directories(destination.parent_path(), forwarder_ec);
+    fs::copy_file(forwarder, destination, fs::copy_options::overwrite_existing,
+                  forwarder_ec);
+    if (forwarder_ec) {
+      safeErrorPrintLn("wpm: failed to install winuxcmd-shim.exe: " +
+                       forwarder_ec.message());
+      return;
+    }
+    safePrintLn("wpm: installed the package-shim forwarder " +
+                destination.string());
+  };
 
   std::error_code ec;
   fs::create_directories(backup_dir(root), ec);
@@ -4264,7 +4405,10 @@ auto apply_update(std::span<const std::string_view> args) -> int {
   } else if (delete_file_name(target)) {
     std::error_code rename_ec;
     fs::rename(staged_target, target, rename_ec);
-    if (!rename_ec) return finish_update(root);
+    if (!rename_ec) {
+      install_forwarder();
+      return finish_update(root);
+    }
     safeErrorPrintLn("wpm: failed to move the updated winuxcmd.exe into place: " +
                      rename_ec.message());
     // The old name is gone; put a usable image back before giving up.
@@ -4302,6 +4446,7 @@ auto apply_update(std::span<const std::string_view> args) -> int {
     finish_update(root);
     return 1;
   }
+  install_forwarder();
   return finish_update(root);
 }
 
@@ -4994,43 +5139,39 @@ auto uninstall_package(const Options& opts, const nlohmann::json& pkg)
   }
 
   // Shim-layout packages keep their payload under opt\<pkg> and forwarders in
-  // usr\bin; drop the forwarders only when they are ours (winuxcmd copies).
+  // usr\bin; drop the forwarders only when they are ours. "Ours" is either a
+  // link to the small forwarder (`winuxcmd-shim.exe`, the current model) or a
+  // link/copy of winuxcmd.exe itself (an installation that predates the
+  // forwarder) - anything else is a user file and stays.
   if (artifact_layout(*artifact) == "shim" && !opts.dry_run) {
     const fs::path self_exe = canonical_winuxcmd_path(opts.root);
+    const fs::path forwarder = package_shim_source(opts.root);
+    auto is_our_shim = [&](const fs::path& candidate) {
+      if (!forwarder.empty() && same_file(forwarder, candidate)) return true;
+      return same_file(self_exe, candidate) || files_equal(self_exe, candidate);
+    };
+    std::vector<std::string> shim_commands;
     for (const auto& item : package_commands_json(pkg)) {
-      if (!item.is_string()) continue;
-      fs::path shim =
-          canonical_bin_dir(opts.root) / exe_suffix(item.get<std::string>());
-      std::error_code ec;
-      if (!fs::exists(shim, ec)) continue;
-      if (same_file(self_exe, shim) || files_equal(self_exe, shim)) {
-        if (!uninstall_remove_destination(opts, shim, false, removed, errors)) {
-          ok = false;
-        }
-      } else {
-        errors.push_back(wpm_text("command.wpm.error.uninstall_protected",
-                                  "wpm: skipping protected file '{}'",
-                                  shim.string()));
-      }
+      if (item.is_string()) shim_commands.push_back(item.get<std::string>());
     }
+    // Aliases first: an alias is a link of its command's shim, so the identity
+    // check has to run while that shim is still in place.
     if (pkg.contains("aliases") && pkg["aliases"].is_array()) {
       for (const auto& alias : pkg["aliases"]) {
         const auto alias_name = alias.is_string() ? alias.get<std::string>()
                                                   : alias.value("name", "");
         auto target_name =
             alias.is_string() ? std::string{} : alias.value("target", "");
-        if (target_name.empty() && pkg.contains("commands") &&
-            pkg["commands"].is_array() && !pkg["commands"].empty() &&
-            pkg["commands"][0].is_string())
-          target_name = pkg["commands"][0].get<std::string>();
+        if (target_name.empty() && !shim_commands.empty())
+          target_name = shim_commands[0];
         if (alias_name.empty() || target_name.empty()) continue;
-        const auto target =
-            package_payload_dir(opts.root, name) / exe_suffix(target_name);
+        const auto command_shim =
+            canonical_bin_dir(opts.root) / exe_suffix(target_name);
         const auto alias_path =
             canonical_bin_dir(opts.root) / exe_suffix(alias_name);
         std::error_code ec;
         if (!fs::exists(alias_path, ec)) continue;
-        if (same_file(target, alias_path)) {
+        if (same_file(command_shim, alias_path)) {
           if (!uninstall_remove_destination(opts, alias_path, false, removed,
                                             errors))
             ok = false;
@@ -5041,6 +5182,23 @@ auto uninstall_package(const Options& opts, const nlohmann::json& pkg)
         }
       }
     }
+    for (const auto& command : shim_commands) {
+      fs::path shim = canonical_bin_dir(opts.root) / exe_suffix(command);
+      std::error_code ec;
+      if (!fs::exists(shim, ec)) continue;
+      if (is_our_shim(shim)) {
+        if (!uninstall_remove_destination(opts, shim, false, removed, errors)) {
+          ok = false;
+        }
+      } else {
+        errors.push_back(wpm_text("command.wpm.error.uninstall_protected",
+                                  "wpm: skipping protected file '{}'",
+                                  shim.string()));
+      }
+    }
+    // A map entry that names a payload this uninstall just removed would keep
+    // `links rebuild` looking for a command that no longer exists.
+    remove_shim_map_entries(opts.root, shim_commands);
     fs::path payload = package_payload_dir(opts.root, name);
     std::error_code payload_ec;
     if (fs::exists(payload, payload_ec)) {

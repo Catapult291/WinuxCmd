@@ -664,6 +664,14 @@ install(TARGETS winuxcmd
         COMPONENT Runtime
 )
 
+# The package-shim forwarder travels with the release: without it a
+# `wpm update winuxcmd` from this archive cannot hand `layout: shim`
+# packages their cheap dispatch (unixwin/WinuxCmd#1207).
+install(TARGETS winuxcmd-shim
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+        COMPONENT Runtime
+)
+
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/scripts/winux.ps1"
         DESTINATION "${CMAKE_INSTALL_BINDIR}"
         COMPONENT Runtime
