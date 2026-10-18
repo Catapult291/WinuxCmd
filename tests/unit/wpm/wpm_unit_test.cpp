@@ -1968,7 +1968,8 @@ TEST(wpm, wpm_shim_packages_use_the_forwarder_when_present) {
                 "\":{\"type\":\"exe\","
                 "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
                 "a1e090af291226f322\",\"layout\":\"shim\","
-                "\"urls\":[\"" + file_url(artifact_path) +
+                "\"urls\":[\"" +
+                file_url(artifact_path) +
                 "\"],\"files\":[{\"from\":\"tool.exe\","
                 "\"to\":\"tool.exe\"}]}}}\n"
                 "  ]\n"
@@ -2007,6 +2008,248 @@ TEST(wpm, wpm_shim_packages_use_the_forwarder_when_present) {
   EXPECT_TRUE(same_file(forwarder, shim));
   EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=opt");
   EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool.exe");
+}
+
+// The uninstall path must recognise a shim that links the forwarder: it used
+// to compare every usr\bin entry against winuxcmd.exe only, so a forwarder
+// package could never be uninstalled and left its map entries behind
+// (unixwin/WinuxCmd#1207).
+TEST(wpm, wpm_uninstall_removes_forwarder_shims_and_map_entries) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write("fixture-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" +
+                file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"tool.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  const auto forwarder = tmp.path / L"usr" / L"bin" / L"winuxcmd-shim.exe";
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+  const auto shim = tmp.path / L"usr" / L"bin" / L"tool.exe";
+  EXPECT_TRUE(same_file(forwarder, shim));
+  EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=");
+
+  Pipeline uninstall;
+  uninstall.add(L"winuxcmd.exe", {L"wpm", L"uninstall", L"tool", L"--yes",
+                                  L"--root", tmp.wpath()});
+  const auto result = uninstall.run();
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_FALSE(std::filesystem::exists(shim));
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L"opt" / L"tool"));
+  EXPECT_NOT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=");
+  EXPECT_NOT_CONTAINS(result.stderr_text, "protected");
+}
+
+// A shim that is not ours (a user file on the same name) survives an
+// uninstall; the package's own files still go.
+TEST(wpm, wpm_uninstall_keeps_a_foreign_shim_file) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write("fixture-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" +
+                file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"tool.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  const auto forwarder = tmp.path / L"usr" / L"bin" / L"winuxcmd-shim.exe";
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+
+  // Replace the shim with a foreign file: unlink the name first, otherwise the
+  // write would land in the forwarder's inode.
+  const auto shim = tmp.path / L"usr" / L"bin" / L"tool.exe";
+  std::error_code ec;
+  std::filesystem::remove(shim, ec);
+  ASSERT_FALSE(ec);
+  tmp.write("usr/bin/tool.exe", "a user tool that only looks like a shim\n");
+
+  Pipeline uninstall;
+  uninstall.add(L"winuxcmd.exe", {L"wpm", L"uninstall", L"tool", L"--yes",
+                                  L"--json", L"--root", tmp.wpath()});
+  const auto result = uninstall.run();
+  // The refusal is soft: the package itself is removed, the foreign file is
+  // reported and kept.
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_TRUE(std::filesystem::exists(shim));
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L"opt" / L"tool"));
+  EXPECT_CONTAINS(result.stdout_text, "protected");
+  EXPECT_CONTAINS(result.stdout_text, "\"status\": \"removed\"");
+  // The map entry goes with the package either way.
+  EXPECT_NOT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=");
+}
+
+// An installation that received the forwarder through a self-update has no
+// map yet and its shims are still links of winuxcmd.exe. One
+// `links rebuild --force` - which activation runs at every shell start - has
+// to record the payloads and move the shims onto the forwarder
+// (unixwin/WinuxCmd#1207).
+TEST(wpm, wpm_links_rebuild_migrates_legacy_shim_receipts) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write("fixture-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" +
+                file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"tool.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  // The legacy state: the shim links winuxcmd.exe and the map does not exist.
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+  const auto shim = tmp.path / L"usr" / L"bin" / L"tool.exe";
+  EXPECT_TRUE(same_file(root_exe, shim));
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L".wpm" / L"shims.map"));
+
+  // The forwarder arrives with a self-update; the next rebuild migrates.
+  const auto forwarder = tmp.path / L"usr" / L"bin" / L"winuxcmd-shim.exe";
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+  Pipeline rebuild;
+  rebuild.add(L"winuxcmd.exe", {L"wpm", L"links", L"rebuild", L"--force",
+                                L"--root", tmp.wpath()});
+  EXPECT_EQ(rebuild.run().exit_code, 0);
+  EXPECT_TRUE(same_file(forwarder, shim));
+  EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=opt\\tool\\tool.exe");
+
+  // Idempotent: a second rebuild keeps the map and the link as they are.
+  Pipeline again;
+  again.add(L"winuxcmd.exe",
+            {L"wpm", L"links", L"rebuild", L"--force", L"--root", tmp.wpath()});
+  EXPECT_EQ(again.run().exit_code, 0);
+  EXPECT_TRUE(same_file(forwarder, shim));
+  EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool=opt\\tool\\tool.exe");
+}
+
+// Self-update lands the staged forwarder in usr\bin, so an installation picks
+// up the cheap dispatch without reinstalling its packages
+// (unixwin/WinuxCmd#1207).
+TEST(wpm, wpm_apply_update_installs_the_forwarder) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  tmp.write("usr/bin/winuxcmd.exe", "old image\n");
+  tmp.write("source/winuxcmd-shim.exe", "forwarder stub\n");
+
+  auto result = run_command(
+      build_winuxcmd_path().wstring(),
+      {L"wpm", L"--", L"__apply-update", L"--root", tmp.wpath(), L"--payload",
+       build_winuxcmd_path().wstring(), L"--parent", L"0", L"--forwarder",
+       (tmp.path / L"source" / L"winuxcmd-shim.exe").wstring()});
+
+  EXPECT_EQ(result.exit_code, 0);
+  EXPECT_EQ(tmp.read("usr/bin/winuxcmd-shim.exe"), "forwarder stub\n");
+  // The swap itself still happened.
+  EXPECT_NE(tmp.read("usr/bin/winuxcmd.exe"), "old image\n");
+
+  // Without a staged forwarder nothing is written and nothing fails.
+  TempDir quiet;
+  const auto quiet_exe = canonical_exe(quiet.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(quiet_exe.parent_path());
+  quiet.write("usr/bin/winuxcmd.exe", "old image\n");
+  auto plain = run_command(
+      build_winuxcmd_path().wstring(),
+      {L"wpm", L"--", L"__apply-update", L"--root", quiet.wpath(), L"--payload",
+       build_winuxcmd_path().wstring(), L"--parent", L"0"});
+  EXPECT_EQ(plain.exit_code, 0);
+  EXPECT_FALSE(std::filesystem::exists(quiet.path / L"usr" / L"bin" /
+                                       L"winuxcmd-shim.exe"));
 }
 
 TEST(wpm, wpm_outdated_uses_receipt_version_after_index_update) {
