@@ -3439,6 +3439,10 @@ TEST(ls, ls_mnt_drive_dialect_resolves) {
 // not fold twice - a double fold would land the as-spelled-missing operand
 // on the real drive path and succeed, while verbatim it fails ENOENT with
 // the operand echoed (the load-bearing negative for boundary (d)).
+// /mnt<drive><drive>... pins the separator between "mnt" and the letter:
+// without it, /mntcc lexically folds to /c and lists the C:\ root, and
+// /mnt<drive><drive>/... folds onto the real drive path (both exist, so
+// verbatim-missing is the only distinguishable outcome).
 TEST(ls, ls_mnt_non_drive_forms_stay_verbatim) {
   TempDir tmp;
   tmp.write("f.txt", "x");
@@ -3448,8 +3452,12 @@ TEST(ls, ls_mnt_non_drive_forms_stay_verbatim) {
       static_cast<wchar_t>(std::tolower(static_cast<unsigned char>(text[0]))));
   const std::wstring double_fold_guard =
       L"/mnt/cygdrive/" + drive + text.substr(2);
-  const std::wstring forms[] = {L"/mnt",      L"/mnt/",    L"/mnt/data",
-                                L"/mnt/cfoo", L"/mnt/123", double_fold_guard};
+  const std::wstring doubled_letter_guard =
+      L"/mnt" + drive + drive + text.substr(2);
+  const std::wstring forms[] = {L"/mnt",           L"/mnt/",
+                                L"/mnt/data",      L"/mnt/cfoo",
+                                L"/mnt/123",       L"/mnt" + drive + drive,
+                                double_fold_guard, doubled_letter_guard};
   for (const auto& form : forms) {
     Pipeline p;
     p.set_cwd(tmp.wpath());
