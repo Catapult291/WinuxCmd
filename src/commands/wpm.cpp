@@ -4229,7 +4229,11 @@ auto apply_update(std::span<const std::string_view> args) -> int {
 
   std::error_code ec;
   fs::create_directories(backup_dir(root), ec);
-  prune_update_backups(root, 2);
+  // Keep one earlier rollback here, before this run writes its own: the fresh
+  // copy below then leaves exactly two in the directory, which is the bound
+  // #1208 accepts, and a swap that fails halfway still has a usable image to
+  // restore from.
+  prune_update_backups(root, 1);
   fs::path target = canonical_winuxcmd_path(root);
   fs::path backup = unique_update_backup_path(root);
   if (fs::exists(target, ec)) {
