@@ -641,6 +641,40 @@ TEST(wpm, wpm_apply_update_replaces_root_and_rebuilds_links) {
   EXPECT_TRUE(same_file(root_exe, wpm_exe));
 }
 
+TEST(wpm, wpm_apply_update_relinks_a_stale_command_link) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+
+  Pipeline rebuild;
+  rebuild.add(L"winuxcmd.exe",
+              {L"wpm", L"links", L"rebuild", L"--root", tmp.wpath()});
+  ASSERT_EQ(rebuild.run().exit_code, 0);
+
+  // Leave one name on a previous image - the mixed state an interrupted
+  // update used to keep silently (#1206). The update itself must move it
+  // onto the new image, so nothing keeps running the old build.
+  const auto previous = tmp.path / L"previous-image.exe";
+  tmp.write("previous-image.exe", "previous winuxcmd image\n");
+  const auto stale = tmp.path / L"usr" / L"bin" / L"yes.exe";
+  std::filesystem::remove(stale);
+  ASSERT_TRUE(CreateHardLinkW(stale.wstring().c_str(),
+                              previous.wstring().c_str(), nullptr) != 0);
+  EXPECT_FALSE(same_file(root_exe, stale));
+
+  auto result = run_command(
+      build_winuxcmd_path().wstring(),
+      {L"wpm", L"--", L"__apply-update", L"--root", tmp.wpath(), L"--payload",
+       build_winuxcmd_path().wstring(), L"--parent", L"0"});
+
+  EXPECT_EQ(result.exit_code, 0);
+  // Every name in usr/bin that links to winuxcmd.exe shares its inode again,
+  // the one that was left behind included.
+  EXPECT_TRUE(same_file(root_exe, stale));
+}
+
 TEST(wpm, wpm_index_update_uses_local_file_source) {
   TempDir tmp;
   const auto index_path = tmp.path / L"fixture-index.json";
@@ -1812,6 +1846,105 @@ TEST(wpm, wpm_clean_backup_removes_rollback_copies) {
   all.add(L"winuxcmd.exe", {L"wpm", L"clean", L"all", L"--root", tmp.wpath()});
   EXPECT_EQ(all.run().exit_code, 0);
   EXPECT_FALSE(std::filesystem::exists(tmp.path / L".wpm" / L"backup"));
+}
+
+namespace {
+
+auto count_update_backups(const std::filesystem::path& root) -> int {
+  int count = 0;
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(
+           root / L".wpm" / L"backup",
+           std::filesystem::directory_options::skip_permission_denied, ec)) {
+    if (entry.path().filename().string().rfind("winuxcmd-before-update-", 0) ==
+        0)
+      ++count;
+  }
+  return count;
+}
+
+}  // namespace
+
+TEST(wpm, wpm_apply_update_keeps_two_rollback_backups) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  tmp.write("usr/bin/winuxcmd.exe", "old image\n");
+
+  // A machine that has updated a few times: one rollback copy per run, never
+  // pruned (#1208). Write time, not the pid in the name, decides what stays.
+  namespace chrono = std::chrono;
+  const auto now = std::filesystem::file_time_type::clock::now();
+  for (int age_hours : {96, 72, 48, 24}) {
+    const auto backup =
+        tmp.write_file(".wpm/backup/winuxcmd-before-update-" +
+                           std::to_string(age_hours) + ".exe",
+                       "image from " + std::to_string(age_hours) + "h ago\n");
+    std::error_code time_ec;
+    std::filesystem::last_write_time(backup, now - chrono::hours(age_hours),
+                                     time_ec);
+    ASSERT_FALSE(time_ec);
+  }
+  EXPECT_EQ(count_update_backups(tmp.path), 4);
+
+  auto result = run_command(
+      build_winuxcmd_path().wstring(),
+      {L"wpm", L"--", L"__apply-update", L"--root", tmp.wpath(), L"--payload",
+       build_winuxcmd_path().wstring(), L"--parent", L"0"});
+
+  EXPECT_EQ(result.exit_code, 0);
+  // Ten updates of the same version leave at most two backup files: the
+  // newest earlier copy, plus the fresh rollback this run just wrote.
+  EXPECT_EQ(count_update_backups(tmp.path), 2);
+  EXPECT_FALSE(std::filesystem::exists(tmp.path / L".wpm" / L"backup" /
+                                       L"winuxcmd-before-update-96.exe"));
+  EXPECT_TRUE(std::filesystem::exists(tmp.path / L".wpm" / L"backup" /
+                                      L"winuxcmd-before-update-24.exe"));
+  // The fresh rollback holds the image this update replaced, so a failed
+  // swap still has something to restore from.
+  EXPECT_CONTAINS(tmp.read(".wpm/backup/winuxcmd-before-update-24.exe"),
+                  "image from 24h ago");
+  const auto backups = tmp.path / L".wpm" / L"backup";
+  for (const auto& entry : std::filesystem::directory_iterator(backups)) {
+    if (entry.path().filename().string() == "winuxcmd-before-update-24.exe")
+      continue;
+    EXPECT_EQ(tmp.read(".wpm/backup/" + entry.path().filename().string()),
+              "old image\n");
+  }
+}
+
+TEST(wpm, wpm_apply_update_failed_swap_keeps_a_usable_backup) {
+  TempDir tmp;
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  tmp.write("usr/bin/winuxcmd.exe", "old image\n");
+
+  // Hold the image the way a running program does - without FILE_SHARE_WRITE
+  // or FILE_SHARE_DELETE - so neither the unlink nor the in-place replace can
+  // land. The update must fail loudly, leave the previous image running, and
+  // keep a usable rollback copy (#1208).
+  HANDLE hold =
+      CreateFileW(root_exe.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_TRUE(hold != INVALID_HANDLE_VALUE);
+  if (hold == INVALID_HANDLE_VALUE) return;
+
+  auto result = run_command(
+      build_winuxcmd_path().wstring(),
+      {L"wpm", L"--", L"__apply-update", L"--root", tmp.wpath(), L"--payload",
+       build_winuxcmd_path().wstring(), L"--parent", L"0"});
+  CloseHandle(hold);
+
+  EXPECT_NE(result.exit_code, 0);
+  EXPECT_CONTAINS(result.stderr_text, "failed to replace winuxcmd.exe");
+  EXPECT_EQ(tmp.read("usr/bin/winuxcmd.exe"), "old image\n");
+  // The one rollback copy still holds the image that was running.
+  EXPECT_EQ(count_update_backups(tmp.path), 1);
+  for (const auto& entry :
+       std::filesystem::directory_iterator(tmp.path / L".wpm" / L"backup")) {
+    EXPECT_CONTAINS(tmp.read(".wpm/backup/" + entry.path().filename().string()),
+                    "old image\n");
+  }
 }
 
 TEST(wpm, wpm_shim_packages_use_the_forwarder_when_present) {
