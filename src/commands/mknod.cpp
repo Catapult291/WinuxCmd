@@ -155,9 +155,14 @@ auto run(const Config& cfg) -> int {
     return 1;
   }
 
-  std::filesystem::path p(cfg.name);
-  std::error_code ec;
-  if (std::filesystem::exists(p, ec)) {
+  // #1235: fold the POSIX drive dialect ("/e/n", "/cygdrive/e/n", "/mnt/e/n")
+  // through the shared boundary before any filesystem call; Win32 resolves a
+  // leading "/e" against the CURRENT drive, so from a C: cwd the existence
+  // probe answered for "<cwd>:\e\n" and a fifo node would land beside the
+  // cwd.  `name` stays verbatim in every message, like MSYS.
+  const auto operand = native_path::make_api_path_operand(cfg.name);
+  if (native_path::operand_target_attributes_w(operand) !=
+      INVALID_FILE_ATTRIBUTES) {
     safeErrorPrint("mknod: ");
     safeErrorPrint(cfg.name);
     safeErrorPrint(": File exists\n");
@@ -165,8 +170,7 @@ auto run(const Config& cfg) -> int {
   }
 
   if (cfg.type == NodeType::Fifo) {
-    const DWORD created =
-        native_path::create_winux_fifo_w(utf8_to_wstring(cfg.name));
+    const DWORD created = native_path::create_winux_fifo_w(operand.normalized);
     if (created != ERROR_SUCCESS) {
       safeErrorPrint("mknod: '");
       safeErrorPrint(cfg.name);
