@@ -140,22 +140,46 @@ REGISTER_COMMAND(
   int exit_code = 0;
 
   for (const auto& filename : ctx.positionals) {
-    std::string file_arg(filename);
-    std::vector<std::string> expanded;
-    if (contains_wildcard(file_arg)) {
-      auto glob_result = glob_expand(file_arg);
+    // #1240: the operand may use any accepted POSIX drive spelling
+    // ("/e/f", "/cygdrive/e/f", "/mnt/e/f"). Handing that raw text to
+    // CreateFileW / GetFileAttributesW / DeleteFileW makes Win32 resolve a
+    // leading "/e" against the CURRENT drive, so from a C: cwd
+    // `shred /e/Data/secret` silently overwrote "C:\e\Data\secret" whenever
+    // that shadow existed (rc 0, wrong target destroyed) and reported
+    // "cannot open" for a perfectly good E:\ file otherwise. A
+    // data-destroying command must fold the dialect through the shared
+    // make_api_path_operand boundary before it touches the filesystem -
+    // before the native-glob pass too, so a "/e/*.log" pattern expands
+    // against the operand drive instead of the cwd drive. The typed
+    // spelling stays in `filename` for every message, like MSYS.
+    const auto operand = native_path::make_api_path_operand(filename);
+
+    // One shred job per matched path: the API form for every Win32 call and
+    // the text the messages quote (the operand as typed, or the path a
+    // glob matched - the shell would have substituted that in argv).
+    struct ShredJob {
+      std::wstring api;
+      std::string display;
+    };
+    std::vector<ShredJob> jobs;
+    if (contains_wildcard(operand.normalized)) {
+      auto glob_result = glob_expand(operand.normalized);
       if (glob_result.expanded) {
         for (const auto& f : glob_result.files) {
-          expanded.push_back(wstring_to_utf8(f));
+          auto matched = native_path::make_api_path_operand_w(f);
+          jobs.push_back({std::move(matched.extended),
+                          wstring_to_utf8(matched.normalized)});
         }
-      } else {
-        expanded.push_back(file_arg);
       }
-    } else {
-      expanded.push_back(file_arg);
+    }
+    if (jobs.empty()) {
+      // No glob match (or no pattern): the operand itself, with the
+      // unmatched pattern kept literal so diagnostics stay useful.
+      jobs.push_back({operand.extended, std::string(filename)});
     }
 
-    for (const auto& exp : expanded) {
+    for (const auto& job : jobs) {
+      const std::string& exp = job.display;
       // [GNU] "-" wipes standard output instead of a named file
       // (shred.c: wipefd(STDOUT_FILENO, ...), uutils #12288). It is only
       // valid when stdout is a regular file; pipes/consoles fail with
@@ -172,7 +196,7 @@ REGISTER_COMMAND(
           continue;
         }
       } else {
-        wfilename = utf8_to_wstring(exp);
+        wfilename = job.api;
         hFile =
             CreateFileW(wfilename.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

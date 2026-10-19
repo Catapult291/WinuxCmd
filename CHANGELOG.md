@@ -8,6 +8,21 @@ repository release tags.
 
 ### Fixed
 
+- **shred**: `shred /e/Data/secret` from a `C:` cwd handed the raw "/e/..."
+  text to CreateFileW, and Win32 resolved a leading `/e` against the
+  CURRENT drive (#1240). For the only data-destroying command in the
+  toolset that misparse was doubly dangerous: when a shadow `C:\e\...`
+  happened to exist, shred silently overwrote THAT file and exited 0 -
+  the requested E:\ target stayed intact, i.e. a false success over the
+  wrong victim; when no shadow existed, a perfectly good E:\ file was
+  reported "cannot open". Every operand now folds through the shared
+  `make_api_path_operand` boundary before the overwrite, the `--force`
+  retry, the native-glob pass (a `/e/*.log` pattern expands against the
+  operand drive) and the `-u`/`--remove` unlink, and the Win32 calls use
+  the extended form like the other post-#1233 commands. Messages keep
+  printing the operand spelling as typed; `/cygdrive/e`, `/mnt/e` and
+  Windows-form spellings share the fold, and a missing operand still
+  fails with rc 1 like MSYS.
 - **mkdir**: `mkdir -p /e/Data` from a `C:` cwd really created a shadow
   `C:\e\Data` tree - the one audited misparse that writes to the wrong
   place (#1233, found by the #1230 sweep). Win32 resolves a leading `/e`
