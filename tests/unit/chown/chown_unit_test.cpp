@@ -805,3 +805,85 @@ TEST(chown, chown_recursive_reference_drive_dialect_walks_operand_drive) {
   EXPECT_FALSE(std::filesystem::exists(
       std::filesystem::path(std::wstring(1, tmp_drive) + L":\\e")));
 }
+
+// ===== CR-on-#1249 regression: root spellings the operand layer collapses
+// ===== The operand layer folds "//" and "///" onto "/" (ls -id / // reports
+// one inode), but a verbatim GetFullPathNameW("//") answers for an UNC-ish
+// name, so keeping those spellings verbatim in the failsafe comparison let
+// `chown -R --preserve-root X //` bypass the check and really modify group
+// ownership under the shell root.  They must hit the root match directly;
+// MSYS pins the texts below ("on '//'" with no suffix).
+namespace chown_root_spelling_detail {
+
+auto narrow(const std::wstring& text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+}  // namespace chown_root_spelling_detail
+
+TEST(chown, chown_preserve_root_all_separator_spellings_are_rejected) {
+  for (const std::wstring operand : {L"//", L"///"}) {
+    Pipeline p;
+    p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", operand});
+
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users",
+                      operand);
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("chown stderr", r.stderr_text);
+
+    EXPECT_EQ(r.exit_code, 1);
+    EXPECT_NE(
+        r.stderr_text.find("it is dangerous to operate recursively on '" +
+                           chown_root_spelling_detail::narrow(operand) + "'"),
+        std::string::npos);
+    EXPECT_NE(r.stderr_text.find("use --no-preserve-root"), std::string::npos);
+  }
+}
+
+TEST(chown, chown_preserve_root_double_slash_component_spelling_is_refused) {
+  // "//e/.." roots at "//e" (POSIX two-slash rule): MSYS resolves it against
+  // that name and reports "cannot access", and so must we - no root match,
+  // no descent.
+  Pipeline p;
+  p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", L"//e/.."});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users",
+                    L"//e/..");
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ(r.stderr_text.find("it is dangerous"), std::string::npos);
+  EXPECT_NE(r.stderr_text.find("cannot access '//e/..'"), std::string::npos);
+}
+
+TEST(chown, chown_preserve_root_dotdot_collapse_spelling_is_rejected) {
+  // "/e/.." lexically collapses onto the root; MSYS fires the failsafe with
+  // the "(same as '/')" suffix.  Purely lexical, so the drive need not
+  // exist.
+  Pipeline p;
+  p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", L"/e/.."});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users", L"/e/..");
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("it is dangerous to operate recursively on "
+                               "'/e/..' (same as '/')"),
+            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("use --no-preserve-root"), std::string::npos);
+}

@@ -29,9 +29,14 @@ repository release tags.
   drive. Security lookups, attribute probes, the recursive walks and the
   glob pattern all fold through the shared boundary first (children
   re-fold from their display spelling, chmod `-R` precedent); error text
-  keeps the user's spelling. An all-separator operand (`/`) stays
-  verbatim in the preserve-root failsafe, whose volume-root comparison
-  must keep seeing the cwd drive.
+  keeps the user's spelling. The preserve-root failsafe gained the same
+  fold, plus direct root matches for the spellings the operand layer
+  collapses onto `/`: all-separator forms (`//`, `///` - a verbatim
+  `GetFullPathNameW("//")` answers for an UNC-ish name, which let
+  `chown -R --preserve-root X //` bypass the check and really walk the
+  shell root) and lexically collapsing forms (`/e/..`, `/tmp/..`), the
+  latter with the `(same as '/')` suffix MSYS prints; `//e/..` keeps the
+  POSIX two-slash rule and resolves against `//e` like MSYS.
 
 ## [1.1.17] - 2026-10-19
 

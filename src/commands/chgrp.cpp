@@ -264,21 +264,68 @@ auto get_volume_root_path(const std::wstring& full_path) -> std::wstring {
   return buffer;
 }
 
+// True when an absolute operand lexically collapses onto the root: the
+// "."/".." reduction consumes every component ("/e/..", "/tmp/..",
+// "///e/../..").  POSIX keeps "//"-prefixed operands rooted at "//" (MSYS
+// resolves "//e/.." against the "//e" name, never "/"), so exactly two
+// leading separators followed by a component opt out.
+auto collapses_onto_root(const std::string& path) -> bool {
+  if (path.empty()) return false;
+  if (path.front() != '/' && path.front() != '\\') return false;
+  size_t leading_separators = 0;
+  while (
+      leading_separators < path.size() &&
+      (path[leading_separators] == '/' || path[leading_separators] == '\\')) {
+    ++leading_separators;
+  }
+  if (leading_separators == 2 && leading_separators < path.size()) {
+    return false;
+  }
+  std::vector<std::string_view> stack;
+  size_t i = 0;
+  while (i < path.size()) {
+    while (i < path.size() && (path[i] == '/' || path[i] == '\\')) {
+      ++i;
+    }
+    const size_t start = i;
+    while (i < path.size() && path[i] != '/' && path[i] != '\\') {
+      ++i;
+    }
+    if (start == i) continue;
+    const std::string_view component(path.data() + start, i - start);
+    if (component == ".") continue;
+    if (component == "..") {
+      if (!stack.empty()) stack.pop_back();
+      continue;
+    }
+    stack.push_back(component);
+  }
+  return stack.empty();
+}
+
 auto get_preserve_root_match(const std::string& input_path)
     -> std::optional<PreserveRootMatch> {
   // #1241: fold the drive dialect first — "/e" names E:\, and an unfolded
   // GetFullPathNameW resolved it against the CURRENT drive, so
   // `chgrp -R --preserve-root /e` from a C: cwd compared "C:\e" against the
   // "C:\" volume root, missed the failsafe and descended into "<cwd>:\e".
-  // An all-separator spelling ("/") stays verbatim: normalize_api_operand
-  // resolves it through the shell tree, and that native root is not the
-  // volume root this failsafe has to match.
-  const bool all_separators =
-      !input_path.empty() &&
-      input_path.find_first_not_of("/\\") == std::string::npos;
-  const std::string folded =
-      all_separators ? input_path
-                     : native_path::normalize_api_operand(input_path);
+  //
+  // All-separator spellings ("//", "///") never reach that fold: the operand
+  // layer collapses them onto "/" (then through the shell tree), while a
+  // verbatim GetFullPathNameW("//") answers for an UNC-ish name — keeping
+  // them verbatim let `chgrp -R --preserve-root X //` bypass the failsafe
+  // and really walk the shell root (CR on #1249).  They hit the root match
+  // directly, printing the operand spelling alone like MSYS ("on '/'",
+  // "on '//'").  A spelling that lexically collapses onto the root fires
+  // with the "(same as '/')" suffix, exactly like MSYS for "/e/..".
+  if (!input_path.empty() &&
+      input_path.find_first_not_of("/\\") == std::string::npos) {
+    return PreserveRootMatch{input_path, false};
+  }
+  if (collapses_onto_root(input_path)) {
+    return PreserveRootMatch{input_path, true};
+  }
+  const std::string folded = native_path::normalize_api_operand(input_path);
   std::wstring full_path = get_full_path(utf8_to_wstring(folded));
   if (full_path.empty()) {
     return std::nullopt;
