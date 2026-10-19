@@ -37,6 +37,15 @@ repository release tags.
   shell root) and lexically collapsing forms (`/e/..`, `/tmp/..`), the
   latter with the `(same as '/')` suffix MSYS prints; `//e/..` keeps the
   POSIX two-slash rule and resolves against `//e` like MSYS.
+- **date**: `date -r FILE` / `--reference=FILE` probed the operand the
+  same way - the raw spelling went straight to `GetFileAttributesExW`,
+  so `/e/Data/ref` and its `/cygdrive/e`, `/mnt/e` spellings reported
+  "failed to get modification time" from a foreign cwd for a file that
+  exists on the operand's drive (#1256, same sweep; the `-f DATEFILE`
+  open was fixed in #1239, this is that family's second read point in
+  date). The operand folds once through the shared
+  `normalize_api_operand` boundary before the attribute probe; the
+  failure message keeps quoting the operand exactly as typed, like MSYS.
 
 ## [1.1.17] - 2026-10-19
 

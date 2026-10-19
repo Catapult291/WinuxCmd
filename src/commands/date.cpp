@@ -1207,8 +1207,18 @@ auto current_time_value(bool use_utc) -> TimeValue {
 
 auto read_reference_time(std::string_view path) -> std::optional<FILETIME> {
   WIN32_FILE_ATTRIBUTE_DATA attributes{};
-  if (!GetFileAttributesExW(utf8_to_wstring(std::string(path)).c_str(),
-                            GetFileExInfoStandard, &attributes)) {
+  // #1256: the operand may use any accepted POSIX drive spelling
+  // ("/e/Data/file", "/cygdrive/e/Data/file", "/mnt/e/Data/file").  Handing
+  // that raw text to GetFileAttributesExW makes Win32 resolve a leading "/e"
+  // against the CURRENT drive, so from a foreign cwd -r reported "failed to
+  // get modification time" for a file that exists on the operand's drive.
+  // The operand folds once through the shared normalize_api_operand
+  // boundary, like the -f DATEFILE read does (#1239); the caller keeps
+  // printing what the user typed in its error message, like MSYS does.
+  const std::wstring api_path =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
+  if (!GetFileAttributesExW(api_path.c_str(), GetFileExInfoStandard,
+                            &attributes)) {
     return std::nullopt;
   }
   return attributes.ftLastWriteTime;
