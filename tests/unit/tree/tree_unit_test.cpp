@@ -290,3 +290,210 @@ TEST(tree, tree_output_file_is_lf_only_and_keeps_summary_issue1214) {
   EXPECT_TRUE(out.find('\n') != std::string::npos);
   EXPECT_TRUE(out.find("directories, ") != std::string::npos);
 }
+
+// ===== #1236 regression: POSIX drive-dialect root operands =====
+//
+// `tree /e/Data` handed the raw "/e/..." text to GetFullPathNameW, and Win32
+// resolves a leading "/e" against the CURRENT drive: from a C: cwd the
+// command rejected a directory that exists on E: - or silently listed the
+// shadow "C:\e\Data" where one happened to exist. The root operand must fold
+// through the shared normalize_api_operand boundary before any Win32 call.
+// The probes below synthesize the dialect spelling from the TempDir's own
+// drive, so the assertions work on any host regardless of which drives exist.
+namespace tree_dialect_detail {
+
+// Lowercase drive letter of an absolute path ("C:\x" -> L'c').
+auto drive_letter(const std::filesystem::path &path) -> wchar_t {
+  wchar_t drive = path.wstring()[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  return drive;
+}
+
+// "C:\Users\...\wct" -> "/c/Users/.../wct" (MSYS drive spelling).
+auto slash_drive_form(const std::filesystem::path &path) -> std::wstring {
+  std::wstring text = path.wstring();
+  text[0] = drive_letter(path);
+  text.erase(1, 1);  // drop the ':' from "c:\..."
+  for (wchar_t &ch : text) {
+    if (ch == L'\\') ch = L'/';
+  }
+  return L"/" + text;
+}
+
+// "/cygdrive/c/Users/..." spelling.
+auto cygdrive_form(const std::filesystem::path &path) -> std::wstring {
+  return L"/cygdrive" + slash_drive_form(path);
+}
+
+// "/mnt/c/Users/..." spelling.
+auto mnt_form(const std::filesystem::path &path) -> std::wstring {
+  return L"/mnt" + slash_drive_form(path);
+}
+
+// UTF-8 form of the operand for exact message comparisons.
+auto utf8(const std::wstring &text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+// First fixed drive whose letter differs from OTHER, or L'\0' when none.
+auto other_fixed_drive(wchar_t other) -> wchar_t {
+  wchar_t buf[512];
+  const DWORD len =
+      GetLogicalDriveStringsW(static_cast<DWORD>(std::size(buf)), buf);
+  for (DWORD i = 0; i + 1 < len;) {
+    const wchar_t *entry = buf + i;
+    const size_t entry_len = std::wcslen(entry);
+    if (entry_len == 0) break;
+    i += static_cast<DWORD>(entry_len) + 1;
+    if (entry_len < 3 || entry[1] != L':' || entry[2] != L'\\') continue;
+    wchar_t drive = entry[0];
+    if (drive >= L'A' && drive <= L'Z') {
+      drive = static_cast<wchar_t>(drive - L'A' + L'a');
+    }
+    if (drive == other) continue;
+    if (GetDriveTypeW(entry) != DRIVE_FIXED) continue;
+    return drive;
+  }
+  return L'\0';
+}
+
+// Keep the shell-namespace mapping out of the way: the dialect fold must land
+// on the operand drive with the shell root unconfigured too.
+void clear_shell_root_env(Pipeline &pipeline) {
+  for (const auto *name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+}  // namespace tree_dialect_detail
+
+TEST(tree, tree_drive_dialect_operand_lists_operand_drive) {
+  TempDir tmp;
+  tmp.write("wb-marker.txt", "x");
+  std::filesystem::create_directories(tmp.path / "wbsub");
+  tmp.write("wbsub/inner.txt", "y");
+  const std::wstring operand = tree_dialect_detail::slash_drive_form(tmp.path);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  tree_dialect_detail::clear_shell_root_env(p);
+  p.add(L"tree.exe", {L"-L", L"1", operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("tree.exe", L"-L", L"1", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("tree drive dialect stdout", r.stdout_text);
+
+  // Before #1236 this rejected the operand (or listed a cwd-drive shadow).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text, "wb-marker.txt");
+  EXPECT_NOT_CONTAINS(r.stdout_text, "cannot access");
+}
+
+TEST(tree, tree_cygdrive_and_mnt_operands_list_operand_drive) {
+  TempDir tmp;
+  tmp.write("wb-marker.txt", "x");
+
+  for (const std::wstring operand :
+       {tree_dialect_detail::cygdrive_form(tmp.path),
+        tree_dialect_detail::mnt_form(tmp.path)}) {
+    Pipeline p;
+    p.set_cwd(tmp.wpath());
+    tree_dialect_detail::clear_shell_root_env(p);
+    p.add(L"tree.exe", {operand});
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("tree.exe", operand);
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("tree cygdrive/mnt stdout", r.stdout_text);
+
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_CONTAINS(r.stdout_text, "wb-marker.txt");
+    EXPECT_NOT_CONTAINS(r.stdout_text, "cannot access");
+  }
+}
+
+TEST(tree, tree_bare_drive_root_operand_lists_drive_root) {
+  TempDir tmp;
+  const wchar_t drive = tree_dialect_detail::drive_letter(tmp.path);
+  const std::wstring operand = std::wstring(L"/") + drive;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  tree_dialect_detail::clear_shell_root_env(p);
+  p.add(L"tree.exe", {L"-L", L"1", operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("tree.exe", L"-L", L"1", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("tree bare drive root stdout", r.stdout_text);
+
+  // "/x" names the root of the drive, not <cwd>:\x: the header is the drive
+  // root itself and nothing is rejected.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text,
+                  std::string(1, static_cast<char>(
+                                     std::toupper(static_cast<unsigned char>(
+                                         static_cast<char>(drive))))) +
+                      ":\\");
+  EXPECT_NOT_CONTAINS(r.stdout_text, "cannot access");
+}
+
+TEST(tree, tree_drive_dialect_from_foreign_cwd_lists_operand_drive) {
+  TempDir tmp;
+  tmp.write("wb-marker.txt", "x");
+  const wchar_t other = tree_dialect_detail::other_fixed_drive(
+      tree_dialect_detail::drive_letter(tmp.path));
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+  const std::wstring operand = tree_dialect_detail::slash_drive_form(tmp.path);
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, other) + L":\\");
+  tree_dialect_detail::clear_shell_root_env(p);
+  p.add(L"tree.exe", {operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("tree.exe", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("tree foreign-cwd dialect stdout", r.stdout_text);
+
+  // The audit's exact shadow shape: cwd on one drive, operand on another.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text, "wb-marker.txt");
+  EXPECT_NOT_CONTAINS(r.stdout_text, "cannot access");
+}
+
+TEST(tree, tree_missing_dir_error_quotes_operand_spelling) {
+  TempDir tmp;
+  const std::wstring operand =
+      tree_dialect_detail::slash_drive_form(tmp.path / L"absent1236");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  tree_dialect_detail::clear_shell_root_env(p);
+  p.add(L"tree.exe", {operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("tree.exe", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("tree missing-dir stdout", r.stdout_text);
+
+  // [GNU] the message quotes what the user typed, never the folded native
+  // form (MSYS prints the operand spelling, #1234 nit precedent).
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_CONTAINS(r.stdout_text,
+                  "cannot access '" + tree_dialect_detail::utf8(operand) + "'");
+}
