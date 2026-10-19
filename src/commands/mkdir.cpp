@@ -126,8 +126,12 @@ auto apply_directory_mode(const std::string& path, std::string_view mode)
   if (!writable) return std::unexpected(writable.error());
 
   // Extended API path so -m works on >MAX_PATH directories too (#1061).
+  // The operand is folded through the shared boundary first: a raw
+  // "/e/Data" spelling handed to GetFullPathNameW resolves against the
+  // CURRENT drive (#1233), so the mode would land on "<cwd>:\e\Data".
   const std::wstring wpath = native_path::to_extended_path(
-      native_path::strip_trailing_separators(utf8_to_wstring(path)));
+      native_path::strip_trailing_separators(utf8_to_wstring(
+          native_path::normalize_api_operand(path))));
   DWORD attrs = GetFileAttributesW(wpath.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return std::unexpected("cannot read directory attributes");
@@ -239,8 +243,14 @@ auto report_create_failure(const std::string& path, DWORD error) -> void {
 
 auto directory_exists_utf8(const std::string& path) -> bool {
   // attributes_w applies the \\?\ extended prefix, so existence checks work
-  // beyond MAX_PATH (#1061).
-  return native_path::is_directory(path);
+  // beyond MAX_PATH (#1061).  The operand is folded through the shared
+  // boundary first (#1233): "/e" names E:\, and an unfolded probe against
+  // GetFullPathNameW would test "<cwd>:\e" instead, so `mkdir -p /e/Data`
+  // mis-judged which components exist and the -v report lied about them.
+  const auto operand = native_path::make_api_path_operand(path);
+  const DWORD attrs = native_path::operand_target_attributes_w(operand);
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 auto preferred_separator(std::string_view path) -> char {
@@ -303,7 +313,16 @@ auto progressive_directory_paths(std::string_view path)
 }
 
 auto create_directory(const std::string& path, const Config& config) -> bool {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1233: the operand may use any accepted POSIX drive spelling ("/e/Data",
+  // "/cygdrive/e/Data", "/mnt/e/Data").  Handing that raw text to
+  // CreateDirectoryW / create_directories makes Win32 resolve a leading "/e"
+  // against the CURRENT drive, so from a C: cwd `mkdir -p /e/Data` really
+  // created "C:\e" — a write-side command must fold the dialect through the
+  // shared normalize_api_operand boundary before it touches the filesystem.
+  // `path` stays verbatim for the GNU-style messages below (verbose and
+  // error text print what the user typed, like MSYS does).
+  const std::wstring wpath =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
   bool existed_before = directory_exists_utf8(path);
 
   if (config.parents) {
