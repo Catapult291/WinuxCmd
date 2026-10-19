@@ -121,7 +121,16 @@ auto line_for_compare(std::string_view line, const std::string& terminator,
 // Read all lines from a file.
 auto read_lines(const std::string& filename, std::vector<std::string>& out)
     -> bool {
-  std::wstring wfn = utf8_to_wstring(filename);
+  // #1242: the dictionary operand may use any accepted POSIX drive spelling
+  // ("/e/words", "/cygdrive/e/words", "/mnt/e/words").  Opening the raw text
+  // made CreateFileW resolve a leading "/e" against the CURRENT drive, so
+  // the lookup answered for "<cwd>:\e\words" and every dialect form reported
+  // "cannot open" for a dictionary that exists on the named drive.  The
+  // operand folds once through the shared normalize_api_operand boundary
+  // here at the open; the caller keeps printing the operand verbatim in the
+  // error message (#1234 display/fold split).
+  std::wstring wfn =
+      utf8_to_wstring(native_path::normalize_api_operand(filename));
   HANDLE h = CreateFileW(wfn.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;
