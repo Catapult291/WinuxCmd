@@ -6,6 +6,33 @@ repository release tags.
 
 ## [Unreleased]
 
+### Fixed
+
+- **mkdir**: `mkdir -p /e/Data` from a `C:` cwd really created a shadow
+  `C:\e\Data` tree - the one audited misparse that writes to the wrong
+  place (#1233, found by the #1230 sweep). Win32 resolves a leading `/e`
+  against the CURRENT drive, so the raw operand reached
+  CreateDirectoryW / `create_directories` rooted on the wrong volume, an
+  existing `E:\Data` reported ENOENT instead of "File exists", and `-m` /
+  `-v` answered for the shadow path. Every operand now folds through the
+  shared `normalize_api_operand` boundary once on entry to
+  `create_directory` (and in the `-m`/existence helpers) before any
+  filesystem call; GNU-style messages keep printing what the user typed,
+  like MSYS does. `/cygdrive/e`, `/mnt/e` and bare `/e` spellings all
+  share the fold, and `mkdir -p /e` (bare drive root) is a silent no-op
+  instead of creating `<cwd>:\e`.
+- **ln**: `/e/...` link operands resolved against the cwd drive (#1234,
+  same sweep). `std::filesystem::absolute`/`GetFileAttributesW`/
+  `FindFirstFileW`/`CreateHardLinkW`/`CreateSymbolicLinkW` all rooted a
+  raw `/e/Data` spelling on the current drive, so the hard-link source
+  probe failed with "failed to access", `-t DIR` rejected a real
+  directory, and a privileged `ln -s` wrote the link beside the cwd
+  instead of on the operand's drive. Sources and targets fold through
+  `normalize_api_operand` once per job (and in the directory-detection
+  probes) before any Win32 call; create-stage error text quotes the
+  operand spelling as typed. Messages and link text stay verbatim; only
+  the API-facing path is folded.
+
 ### Added
 
 - **native path**: `/mnt/X/...` operands resolve like `/X/...` and `X:\...` -
