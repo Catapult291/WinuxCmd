@@ -70,7 +70,16 @@ auto read_c_string(const std::vector<std::byte>& data, size_t offset)
 
 auto load_file(const std::string& path)
     -> std::expected<std::vector<std::byte>, std::string> {
-  std::ifstream file(path, std::ios::binary);
+  // #1238: the operand may use any accepted POSIX drive spelling
+  // ("/e/x.exe", "/cygdrive/e/x.exe", "/mnt/e/x.exe").  Handing that raw
+  // text to std::ifstream makes the CRT resolve a leading "/e" against the
+  // CURRENT drive, so from a foreign cwd ldd reported "cannot open" for a
+  // file that exists on the operand's drive.  The operand folds once
+  // through the shared normalize_api_operand boundary here - the single
+  // point every caller opens through - while the error messages below keep
+  // the verbatim spelling, like MSYS prints what the user typed.
+  std::ifstream file(native_path::normalize_api_operand(path),
+                     std::ios::binary);
   if (!file) return std::unexpected("cannot open '" + path + "'");
   file.seekg(0, std::ios::end);
   std::streamoff size = file.tellg();

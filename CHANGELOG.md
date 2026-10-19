@@ -54,6 +54,24 @@ repository release tags.
   probes) before any Win32 call; create/removal error text quotes the
   operand spelling as typed. Messages and link text stay verbatim; only
   the API-facing path is folded.
+- **ldd**: `/e/x.exe`, `/cygdrive/e/x.exe` and `/mnt/e/x.exe` operands were
+  handed as raw text to a bare `std::ifstream`, and the CRT resolves a
+  leading `/e` against the CURRENT drive - from a foreign cwd every POSIX
+  spelling reported `cannot open` for a file that exists on the operand's
+  drive, while MSYS ldd opens the same spelling from anywhere (#1238,
+  found by the #1230 sweep). The operand now folds once through the shared
+  `normalize_api_operand` boundary at `load_file`, the single point every
+  caller opens through (covering the default, `--name` and `--unused`
+  paths); error messages keep quoting the operand exactly as typed.
+- **date**: `date -f DATEFILE` opened the file the same way, so
+  `/e/Data/dates.txt` and its `/cygdrive/e`, `/mnt/e` spellings reported
+  `No such file or directory` from a foreign cwd, and the directory probe
+  that produces the "Is a directory" report ran against the shadow path
+  too (#1239, same sweep). The `-f` operand folds through the shared
+  `normalize_api_operand` boundary before the `is_directory` probe and
+  the open; the open-failure messages keep printing the operand as the
+  user typed it. Bare `/e` (drive root) now correctly reports
+  "read error: Is a directory" instead of ENOENT.
 
 ### Added
 

@@ -2375,9 +2375,20 @@ REGISTER_COMMAND(
       // [GNU/Linux] fopen on a directory succeeds but the first read fails
       // with EISDIR, so GNU reports "<file>: read error: Is a directory";
       // every other open failure reports strerror(errno) after the file.
+      //
+      // #1239: the operand may use any accepted POSIX drive spelling
+      // ("/e/Data/file", "/cygdrive/e/Data/file", "/mnt/e/Data/file").
+      // Handing that raw text to is_directory/std::ifstream makes Win32
+      // resolve a leading "/e" against the CURRENT drive, so from a
+      // foreign cwd date reported ENOENT for a file that exists on the
+      // operand's drive.  The operand folds once through the shared
+      // normalize_api_operand boundary here; the messages below keep
+      // printing what the user typed, like MSYS does.
+      const std::string api_path =
+          native_path::normalize_api_operand(date_file);
       std::error_code ec;
-      const bool is_dir = std::filesystem::is_directory(date_file, ec);
-      file_stream.open(date_file, std::ios::binary);
+      const bool is_dir = std::filesystem::is_directory(api_path, ec);
+      file_stream.open(api_path, std::ios::binary);
       if (!file_stream) {
         if (is_dir) {
           safeErrorPrintLn(winux::i18n::format(
