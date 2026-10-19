@@ -8,6 +8,28 @@ repository release tags.
 
 ### Fixed
 
+- **tree**: the root operand resolved through bare `GetFullPathNameW`, so a
+  `/e/Data` spelling rooted on the CURRENT drive: from a `C:` cwd
+  `tree /e/Data` rejected a directory that exists on `E:` - or silently
+  listed the shadow `C:\e\Data` where one happened to exist, the dangerous
+  cwd-drive-drift form (#1236, found by the #1230 sweep). The operand folds
+  once through the shared `normalize_api_operand` boundary before any Win32
+  call; `/cygdrive/e`, `/mnt/e` and bare `/e` spellings all share the fold.
+  The "cannot access" message quotes the operand spelling as typed instead
+  of the folded native form, like MSYS does.
+- **namei**: every resolution step probed the raw operand text with
+  `GetFileAttributesW`, so all drive-dialect forms reported a broken chain
+  (`f e (No such file or directory)`) for paths that exist on the named
+  drive (#1237, same sweep). The operand folds once through the shared
+  `make_api_path_operand` boundary and the walk runs on the folded native
+  spelling, so each component of `/e/Data/...` resolves on `E:`; the header
+  line still prints the operand exactly as typed.
+- **look**: the dictionary file operand was opened as raw text, so
+  `/e/words` rooted on the cwd drive and every dialect form reported
+  "cannot open" for a word list that exists on the named drive (#1242,
+  same sweep). The operand folds through the shared `normalize_api_operand`
+  boundary at the open; the error message keeps quoting the operand
+  spelling as typed.
 - **mkdir**: `mkdir -p /e/Data` from a `C:` cwd really created a shadow
   `C:\e\Data` tree - the one audited misparse that writes to the wrong
   place (#1233, found by the #1230 sweep). Win32 resolves a leading `/e`
