@@ -202,10 +202,12 @@ auto create_symlink(const std::string &source, const std::string &target,
 
 /**
  * @brief Remove existing file/directory
- * @param path Path to remove
+ * @param path Path to remove (folded API form, see the #1234 call site)
+ * @param path_display Path as the user typed it, for messages
  * @return Result with success status
  */
-auto remove_existing(const std::string &path) -> cp::Result<void> {
+auto remove_existing(const std::string &path,
+                     const std::string &path_display) -> cp::Result<void> {
   std::wstring wpath = utf8_to_wstring(path);
 
   DWORD attrs = GetFileAttributesW(wpath.c_str());
@@ -235,7 +237,7 @@ auto remove_existing(const std::string &path) -> cp::Result<void> {
   }
 
   DWORD error = GetLastError();
-  return std::unexpected("failed to remove '" + path +
+  return std::unexpected("failed to remove '" + path_display +
                          "': " + ln_windows_error_text(error));
 }
 
@@ -494,7 +496,7 @@ REGISTER_COMMAND(
         }
       } else if (force) {
         // Remove existing target if force is set
-        auto result = remove_existing(target_api);
+        auto result = remove_existing(target_api, target);
         if (!result) {
           safeErrorPrint("ln: ");
           safeErrorPrint(result.error());

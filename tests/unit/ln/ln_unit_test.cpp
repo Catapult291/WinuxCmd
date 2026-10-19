@@ -628,3 +628,39 @@ TEST(ln, ln_drive_dialect_create_failure_message_keeps_operand_spelling) {
                       ln_dialect_detail::utf8(target) + "'");
   EXPECT_NOT_CONTAINS(r.stderr_text, ":\\");
 }
+
+// Same invariant for the -f removal path: a force-remove that cannot
+// complete (non-empty directory target) must quote the operand spelling,
+// never the folded "X:\..." API form (#1234 review nit).
+TEST(ln, ln_fT_drive_dialect_remove_failure_message_keeps_operand_spelling) {
+  TempDir tmp;
+  tmp.write("probe1233", "payload");
+  // The forced-removal victim: a non-empty directory, which RemoveDirectoryW
+  // refuses, so the failure message is produced deterministically.
+  std::filesystem::create_directory(tmp.path / L"nonempty1234");
+  tmp.write("nonempty1234\\keeper", "anchor");
+  const std::wstring source =
+      ln_dialect_detail::slash_drive_form(tmp.path / L"probe1233");
+  const std::wstring target =
+      ln_dialect_detail::slash_drive_form(tmp.path / L"nonempty1234");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"ln.exe", {L"-fT", source, target});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("ln.exe", L"-fT", source, target);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("ln -fT stderr", r.stderr_text);
+
+  // The removal failed at the OS level and ln reported it...
+  ASSERT_NE(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stderr_text, "failed to remove");
+  // ...quoting the operand spelling, not the folded form.
+  EXPECT_CONTAINS(r.stderr_text,
+                  "failed to remove '" + ln_dialect_detail::utf8(target) + "'");
+  EXPECT_NOT_CONTAINS(r.stderr_text, ":\\");
+  // The non-empty directory survived (nothing was force-removed).
+  EXPECT_TRUE(std::filesystem::is_directory(tmp.path / L"nonempty1234"));
+}

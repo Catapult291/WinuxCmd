@@ -29,7 +29,7 @@ repository release tags.
   directory, and a privileged `ln -s` wrote the link beside the cwd
   instead of on the operand's drive. Sources and targets fold through
   `normalize_api_operand` once per job (and in the directory-detection
-  probes) before any Win32 call; create-stage error text quotes the
+  probes) before any Win32 call; create/removal error text quotes the
   operand spelling as typed. Messages and link text stay verbatim; only
   the API-facing path is folded.
 
