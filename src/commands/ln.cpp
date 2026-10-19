@@ -95,6 +95,9 @@ auto join_target_path(const std::string &directory, const std::string &source)
 }
 
 // [GNU] -r/--relative: symbolic-link targets are relative to the link.
+// SOURCE and TARGET arrive already folded through normalize_api_operand
+// (#1234): std::filesystem::absolute would root a raw "/e/x" spelling on the
+// CURRENT drive and compute the relative form against the wrong base.
 auto relative_symlink_target(const std::string &source,
                              const std::string &target) -> std::string {
   std::error_code ec;
@@ -124,41 +127,47 @@ auto ln_creation_failure_prefix(bool symbolic, const std::string &target)
 
 /**
  * @brief Create a hard link
- * @param source Source file path
- * @param target Target link path
+ * @param source Source file path (folded API form, see the #1234 call site)
+ * @param target Target link path (folded API form, see the #1234 call site)
  * @param verbose Print verbose output
+ * @param source_display Source as the user typed it, for messages
+ * @param target_display Target as the user typed it, for messages
  * @return Result with success status
  */
 auto create_hardlink(const std::string &source, const std::string &target,
-                     bool verbose) -> cp::Result<void> {
+                     bool verbose, const std::string &source_display,
+                     const std::string &target_display) -> cp::Result<void> {
   std::wstring wsource = utf8_to_wstring(source);
   std::wstring wtarget = utf8_to_wstring(target);
 
   if (CreateHardLinkW(wtarget.c_str(), wsource.c_str(), nullptr)) {
     if (verbose) {
       safePrint("'");
-      safePrint(target);
+      safePrint(target_display);
       safePrint("' => '");
-      safePrint(source);
+      safePrint(source_display);
       safePrint("'\n");
     }
     return {};
   }
 
   DWORD error = GetLastError();
-  return std::unexpected("failed to create hard link '" + target +
+  return std::unexpected("failed to create hard link '" + target_display +
                          "': " + ln_windows_error_text(error));
 }
 
 /**
  * @brief Create a symbolic link
- * @param source Source file/directory path
- * @param target Target link path
+ * @param source Source file/directory path (folded API form, #1234)
+ * @param target Target link path (folded API form, #1234)
  * @param verbose Print verbose output
+ * @param source_display Source as the user typed it, for messages
+ * @param target_display Target as the user typed it, for messages
  * @return Result with success status
  */
 auto create_symlink(const std::string &source, const std::string &target,
-                    bool verbose) -> cp::Result<void> {
+                    bool verbose, const std::string &source_display,
+                    const std::string &target_display) -> cp::Result<void> {
   // [DIFFERS] #1101: reparse-point targets must use backslash separators;
   // "./bds" or "dir/file" resolve as ERROR_INVALID_NAME on native Windows.
   // Store the user-visible link text unchanged, but normalize what goes
@@ -178,16 +187,16 @@ auto create_symlink(const std::string &source, const std::string &target,
   if (CreateSymbolicLinkW(wtarget.c_str(), wsource.c_str(), flags)) {
     if (verbose) {
       safePrint("'");
-      safePrint(target);
+      safePrint(target_display);
       safePrint("' => '");
-      safePrint(source);
+      safePrint(source_display);
       safePrint("'\n");
     }
     return {};
   }
 
   DWORD error = GetLastError();
-  return std::unexpected("failed to create symbolic link '" + target +
+  return std::unexpected("failed to create symbolic link '" + target_display +
                          "': " + ln_windows_error_text(error));
 }
 
@@ -330,8 +339,11 @@ REGISTER_COMMAND(
     }
     // GNU 9.11 ln.c: missing -t dir reports "failed to access"; an
     // existing non-directory reports "target 'x' is not a directory".
-    std::wstring wtd = utf8_to_wstring(target_dir);
-    DWORD td_attrs = GetFileAttributesW(wtd.c_str());
+    // The attribute probe folds the drive dialect first (#1234): a raw
+    // "/e/Data" spelling resolves against the current drive and the check
+    // would answer for "<cwd>:\e\Data".
+    const auto td_operand = native_path::make_api_path_operand(target_dir);
+    DWORD td_attrs = GetFileAttributesW(td_operand.extended.c_str());
     if (td_attrs == INVALID_FILE_ATTRIBUTES) {
       safeErrorPrint("ln: failed to access '" + target_dir +
                      "': No such file or directory\n");
@@ -370,11 +382,14 @@ REGISTER_COMMAND(
   } else if (ctx.positionals.size() == 2) {
     std::string source(std::string(ctx.positionals[0]));
     std::string target(std::string(ctx.positionals[1]));
-    std::wstring wtarget = utf8_to_wstring(target);
-    DWORD target_attrs = GetFileAttributesW(wtarget.c_str());
+    // Directory detection folds the drive dialect first (#1234): a raw
+    // "/e/Data" operand must be answered for E:\Data, not "<cwd>:\e\Data".
+    const auto target_operand = native_path::make_api_path_operand(target);
+    DWORD target_attrs =
+        GetFileAttributesW(target_operand.extended.c_str());
     std::error_code target_ec;
     const bool target_is_symlink = std::filesystem::is_symlink(
-        std::filesystem::symlink_status(target, target_ec));
+        std::filesystem::symlink_status(target_operand.normalized, target_ec));
     if (target_attrs != INVALID_FILE_ATTRIBUTES &&
         (target_attrs & FILE_ATTRIBUTE_DIRECTORY) &&
         !(no_dereference && target_is_symlink)) {
@@ -384,8 +399,9 @@ REGISTER_COMMAND(
     }
   } else {
     target_dir = std::string(ctx.positionals.back());
-    std::wstring wtd = utf8_to_wstring(target_dir);
-    DWORD td_attrs = GetFileAttributesW(wtd.c_str());
+    // Same dialect fold as the -t branch (#1234).
+    const auto td_operand = native_path::make_api_path_operand(target_dir);
+    DWORD td_attrs = GetFileAttributesW(td_operand.extended.c_str());
     if (td_attrs == INVALID_FILE_ATTRIBUTES ||
         !(td_attrs & FILE_ATTRIBUTE_DIRECTORY)) {
       // GNU 9.11 ln.c: errno-style "target 'x': <reason>".
@@ -408,20 +424,34 @@ REGISTER_COMMAND(
 
   for (const auto &[job_source, target] : link_jobs) {
     std::string source = job_source;
+    // #1234: fold the drive dialect once per job, before any Win32 call.
+    // Raw "/e/..." spellings handed to CreateHardLinkW / CreateSymbolicLinkW
+    // / GetFileAttributesW resolve a leading "/e" against the CURRENT drive,
+    // so from a C: cwd `ln -s /e/Data /e/Data/link` really wrote
+    // "C:\e\Data\link" and the hard-link source probe looked for
+    // "C:\e\Data\probe". Messages below keep the operand text verbatim.
+    std::string source_api = native_path::normalize_api_operand(source);
+    const std::string target_api = native_path::normalize_api_operand(target);
     if (!symbolic && logical) {
       std::error_code source_ec;
       auto resolved =
-          std::filesystem::canonical(utf8_to_wstring(source), source_ec);
-      if (!source_ec) source = wstring_to_utf8(resolved.wstring());
+          std::filesystem::canonical(utf8_to_wstring(source_api), source_ec);
+      if (!source_ec) {
+        source_api = wstring_to_utf8(resolved.wstring());
+        source = source_api;
+      }
     }
-    if (symbolic && relative) source = relative_symlink_target(source, target);
+    if (symbolic && relative) {
+      source = relative_symlink_target(source_api, target_api);
+      source_api = native_path::normalize_api_operand(source);
+    }
 
     // [GNU] For hard links, ln stats the source first so a missing TARGET
     // reports "failed to access 'src'".  FindFirstFileW is the lstat
     // equivalent here: a dangling symlink still counts as existing.
     if (!symbolic) {
       WIN32_FIND_DATAW sfd{};
-      HANDLE sh = FindFirstFileW(utf8_to_wstring(source).c_str(), &sfd);
+      HANDLE sh = FindFirstFileW(utf8_to_wstring(source_api).c_str(), &sfd);
       if (sh == INVALID_HANDLE_VALUE) {
         safeErrorPrint("ln: failed to access '" + source +
                        "': No such file or directory\n");
@@ -432,7 +462,7 @@ REGISTER_COMMAND(
     }
 
     // Check if target exists
-    std::wstring wtarget = utf8_to_wstring(target);
+    std::wstring wtarget = utf8_to_wstring(target_api);
     DWORD target_attrs = GetFileAttributesW(wtarget.c_str());
     bool target_exists = (target_attrs != INVALID_FILE_ATTRIBUTES);
 
@@ -449,7 +479,7 @@ REGISTER_COMMAND(
 
       // Backup if requested
       if (backup && target_exists) {
-        std::string backup_name = target + backup_suffix;
+        std::string backup_name = target_api + backup_suffix;
         std::wstring wbackup = utf8_to_wstring(backup_name);
         // Remove existing backup if any
         DeleteFileW(wbackup.c_str());
@@ -464,7 +494,7 @@ REGISTER_COMMAND(
         }
       } else if (force) {
         // Remove existing target if force is set
-        auto result = remove_existing(target);
+        auto result = remove_existing(target_api);
         if (!result) {
           safeErrorPrint("ln: ");
           safeErrorPrint(result.error());
@@ -485,9 +515,13 @@ REGISTER_COMMAND(
       }
     }
 
-    // Create the link
-    auto result = symbolic ? create_symlink(source, target, verbose)
-                           : create_hardlink(source, target, verbose);
+    // Create the link.  The folded forms drive the Win32 calls; the raw
+    // operand text rides along for messages, like MSYS prints them (#1234).
+    auto result = symbolic
+                      ? create_symlink(source_api, target_api, verbose, source,
+                                       target)
+                      : create_hardlink(source_api, target_api, verbose,
+                                        source, target);
 
     if (!result) {
       safeErrorPrint("ln: ");
