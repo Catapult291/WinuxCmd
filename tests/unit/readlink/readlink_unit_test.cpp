@@ -476,6 +476,16 @@ void clear_shell_root_env(Pipeline& pipeline) {
   }
 }
 
+// #1246: the /cygdrive/X and /mnt/X spellings of a native path.
+auto cygdrive_prefix_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  return L"/cygdrive" + drive_dialect_spelling(native);
+}
+
+auto mnt_prefix_spelling(const std::filesystem::path& native) -> std::wstring {
+  return L"/mnt" + drive_dialect_spelling(native);
+}
+
 }  // namespace
 
 TEST(readlink, readlink_f_drive_dialect_resolves_from_foreign_cwd) {
@@ -516,6 +526,71 @@ TEST(readlink, readlink_f_drive_dialect_directory_operand) {
 
   TEST_LOG_EXIT_CODE(r);
   TEST_LOG("readlink -f drive dialect dir output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text(dir.path.string() + "\n"));
+}
+
+// ===== #1246 regression: /cygdrive/X and /mnt/X prefixes in the resolver =====
+//
+// readlink -f shares canonicalize_path_w with realpath; the resolver used to
+// fold only the single-letter drive form, so the prefix spellings stranded
+// on the cwd while stat folded them at the argv boundary.
+
+TEST(readlink, readlink_f_cygdrive_and_mnt_prefixes_resolve) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "content");
+
+  std::filesystem::path link = dir.path / "link";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"f.txt"))) {
+    return;
+  }
+
+  Pipeline cygdrive;
+  cygdrive.set_cwd(cwd.wpath());
+  clear_shell_root_env(cygdrive);
+  cygdrive.add(L"readlink.exe",
+               {L"-f", cygdrive_prefix_spelling(dir.path) + L"/link"});
+  auto rc = cygdrive.run();
+
+  TEST_LOG_EXIT_CODE(rc);
+  TEST_LOG("readlink -f cygdrive prefix output", rc.stdout_text);
+
+  // Before #1246 the prefix spelling stranded on the cwd and -f failed
+  // ENOENT instead of resolving the link to its target.
+  EXPECT_EQ(rc.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(rc.stdout_text),
+                 normalize_path_text((dir.path / "f.txt").string() + "\n"));
+
+  Pipeline mnt;
+  mnt.set_cwd(cwd.wpath());
+  clear_shell_root_env(mnt);
+  mnt.add(L"readlink.exe", {L"-f", mnt_prefix_spelling(dir.path) + L"/f.txt"});
+  auto rm = mnt.run();
+
+  TEST_LOG_EXIT_CODE(rm);
+  TEST_LOG("readlink -f mnt prefix output", rm.stdout_text);
+
+  EXPECT_EQ(rm.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(rm.stdout_text),
+                 normalize_path_text((dir.path / "f.txt").string() + "\n"));
+}
+
+TEST(readlink, readlink_f_cygdrive_directory_prefix_is_drive_root_dir) {
+  TempDir dir;
+  TempDir cwd;
+  dir.mkdir("prog");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"readlink.exe", {L"-f", cygdrive_prefix_spelling(dir.path)});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("readlink -f cygdrive prefix dir output", r.stdout_text);
 
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),

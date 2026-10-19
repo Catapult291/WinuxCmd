@@ -468,3 +468,73 @@ TEST(stat, stat_lstat_drive_dialect_symlink_reports_link) {
   EXPECT_TRUE(r.stdout_text.find("link") != std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
 }
+
+// ===== #1245 CR NIT-2 regression pin + #1246 argv/resolver agreement =====
+//
+// With a shell root configured, stat routes its operand through the shared
+// argv boundary, so a shell-namespace spelling ("/usr/bin") resolves through
+// the shell tree exactly like ls and readlink -f. Before #1245 the raw
+// "/usr/bin" text was probed directly and failed with ENOENT even though the
+// sibling commands resolved the same operand.
+
+TEST(stat, stat_shell_root_usr_bin_resolves_through_shell_tree) {
+  TempDir root;
+  TempDir cwd;
+  root.write("usr/bin/tool.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  p.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+  p.add(L"stat.exe", {L"/usr/bin"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stat /usr/bin with shell root output", r.stdout_text);
+
+  // [GNU] the File: line echoes the operand as typed; the operand resolves
+  // through the shell tree, so the directory is stat'ed, not ENOENT.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("/usr/bin") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("directory") != std::string::npos);
+  EXPECT_EQ_TEXT(r.stderr_text, "");
+}
+
+TEST(stat, stat_cygdrive_and_mnt_prefix_operands_resolve) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "data");
+
+  const std::wstring cygdrive =
+      L"/cygdrive" + drive_dialect_spelling(dir.path) + L"/f.txt";
+  const std::wstring mnt =
+      L"/mnt" + drive_dialect_spelling(dir.path) + L"/f.txt";
+
+  Pipeline cyg;
+  cyg.set_cwd(cwd.wpath());
+  clear_shell_root_env(cyg);
+  cyg.add(L"stat.exe", {cygdrive});
+  auto rc = cyg.run();
+
+  TEST_LOG_EXIT_CODE(rc);
+  TEST_LOG("stat cygdrive prefix output", rc.stdout_text);
+
+  // stat folded this spelling at the argv boundary since #1145; the pin
+  // keeps the #1246 resolver fold agreeing with it (realpath/readlink -f
+  // must answer the same spelling the same way).
+  EXPECT_EQ(rc.exit_code, 0);
+  EXPECT_TRUE(rc.stdout_text.find("f.txt") != std::string::npos);
+  EXPECT_EQ_TEXT(rc.stderr_text, "");
+
+  Pipeline m;
+  m.set_cwd(cwd.wpath());
+  clear_shell_root_env(m);
+  m.add(L"stat.exe", {mnt});
+  auto rm = m.run();
+
+  TEST_LOG_EXIT_CODE(rm);
+  TEST_LOG("stat mnt prefix output", rm.stdout_text);
+
+  EXPECT_EQ(rm.exit_code, 0);
+  EXPECT_TRUE(rm.stdout_text.find("f.txt") != std::string::npos);
+  EXPECT_EQ_TEXT(rm.stderr_text, "");
+}

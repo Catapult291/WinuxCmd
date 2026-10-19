@@ -665,6 +665,19 @@ void clear_shell_root_env(Pipeline& pipeline) {
   }
 }
 
+// #1246: the /cygdrive/X spelling of a native path ("D:\repo\x" ->
+// "/cygdrive/d/repo/x").
+auto cygdrive_prefix_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  return L"/cygdrive" + drive_dialect_spelling(native);
+}
+
+// #1246: the /mnt/X spelling of a native path ("D:\repo\x" ->
+// "/mnt/d/repo/x").
+auto mnt_prefix_spelling(const std::filesystem::path& native) -> std::wstring {
+  return L"/mnt" + drive_dialect_spelling(native);
+}
+
 }  // namespace
 
 TEST(realpath, realpath_drive_dialect_resolves_from_foreign_cwd) {
@@ -750,4 +763,82 @@ TEST(realpath, realpath_multi_letter_first_segment_is_not_a_drive) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
                  normalize_path_text((cwd.path / "nodrive").string() + "\n"));
+}
+
+// ===== #1246 regression: /cygdrive/X and /mnt/X prefixes in the resolver =====
+//
+// canonicalize_path_w folded only the single-letter drive form (#1231), so
+// realpath/readlink -f stranded "/cygdrive/e/..." on the cwd (ENOENT in the
+// default mode, a "<cwd-drive>:\cygdrive\e\..." spelling under -m) while
+// stat/test -f folded the same spelling at the argv boundary — the two
+// commands disagreed on one operand ("test -f said yes, realpath said no",
+// the #850 family). The resolver now runs the same cygdrive (#1145) and
+// /mnt (#1172) prefix folds before the single-letter rule, in the same
+// order as normalize_api_operand_w.
+
+TEST(realpath, realpath_cygdrive_and_mnt_prefixes_resolve_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.mkdir("prog");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"realpath.exe",
+        {L"-m", cygdrive_prefix_spelling(dir.path) + L"/prog"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("realpath -m cygdrive prefix output", r.stdout_text);
+
+  // Before #1246 -m printed the stranded "<cwd-drive>:\cygdrive\e\..." walk.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text((dir.path / "prog").string() + "\n"));
+
+  Pipeline m;
+  m.set_cwd(cwd.wpath());
+  clear_shell_root_env(m);
+  m.add(L"realpath.exe", {mnt_prefix_spelling(dir.path) + L"/prog"});
+  auto rm = m.run();
+
+  TEST_LOG_EXIT_CODE(rm);
+  TEST_LOG("realpath mnt prefix output", rm.stdout_text);
+
+  // Before #1246 the default mode reported ENOENT for the existing directory.
+  EXPECT_EQ(rm.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(rm.stdout_text),
+                 normalize_path_text((dir.path / "prog").string() + "\n"));
+}
+
+TEST(realpath, realpath_cygdrive_prefix_resolves_identically_with_shell_root) {
+  TempDir dir;
+  TempDir cwd;
+  TempDir root;
+  dir.mkdir("prog");
+
+  for (const bool shell_root : {true, false}) {
+    Pipeline p;
+    p.set_cwd(cwd.wpath());
+    clear_shell_root_env(p);
+    if (shell_root) {
+      // A configured root must not capture the prefix spelling: like the
+      // argv boundary, a folded drive operand is native-dialect input.
+      p.set_env(L"__RUBASH_SHELL_ROOT", root.wpath());
+    }
+    p.add(L"realpath.exe",
+          {L"-m", cygdrive_prefix_spelling(dir.path) + L"/prog"});
+    auto r = p.run();
+
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("realpath cygdrive prefix, shell root=" +
+                 std::string(shell_root ? "set" : "cleared"),
+             r.stdout_text);
+
+    // Both states print the native spelling; before #1246 the configured
+    // state stranded the operand under <root>\cygdrive\e\... instead.
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                   normalize_path_text((dir.path / "prog").string() + "\n"));
+  }
 }

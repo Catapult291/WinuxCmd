@@ -329,6 +329,75 @@ auto shell_tree_display_w(std::wstring_view native)
   return under(shell_ns::home_parent_w(), L"/home");
 }
 
+// Fold the Cygwin "/cygdrive/X" (#1145) and WSL interop "/mnt/X" (#1172)
+// drive prefixes onto the MSYS single-letter spelling they name: "/e/Data"
+// under either prefix folds to "/e/Data". Both shapes — a case-insensitive
+// "cygdrive" name and a case-sensitive "mnt" literal (the spelling WSL
+// itself emits), each followed by a separator, a drive letter of either
+// case, and end-of-string or another separator — carry the exact recognition
+// the normalize_api_operand_w fold historically applied inline; extracted
+// here so the canonicalize resolver (#1246) runs the same folds instead of
+// diverging from the argv boundary on the same spelling. Bare /mnt and
+// non-drive children ("/mnt/data", "/mntcc") never fold. Returns nullopt
+// when the operand carries neither prefix.
+auto fold_posix_drive_prefix_w(std::wstring_view normalized)
+    -> std::optional<std::wstring> {
+  constexpr std::wstring_view k_cygdrive_name = L"cygdrive";
+  if (normalized.size() >= k_cygdrive_name.size() + 3 &&
+      is_separator(normalized[0])) {
+    bool name_match = true;
+    for (size_t i = 0; i < k_cygdrive_name.size(); ++i) {
+      wchar_t ch = normalized[1 + i];
+      if (ch >= L'A' && ch <= L'Z') {
+        ch = static_cast<wchar_t>(ch - L'A' + L'a');
+      }
+      if (ch != k_cygdrive_name[i]) {
+        name_match = false;
+        break;
+      }
+    }
+    const size_t drive_pos = k_cygdrive_name.size() + 2;
+    const wchar_t drive_ch = normalized[drive_pos];
+    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
+                              (drive_ch >= L'A' && drive_ch <= L'Z');
+    if (name_match && is_separator(normalized[1 + k_cygdrive_name.size()]) &&
+        drive_letter &&
+        (normalized.size() == drive_pos + 1 ||
+         is_separator(normalized[drive_pos + 1]))) {
+      return std::wstring(L"/").append(normalized.substr(drive_pos));
+    }
+  }
+  // The name comparison is case-sensitive by contract: unlike cygdrive, the
+  // literal must be lowercase "mnt" byte-for-byte — the spelling WSL itself
+  // emits, and the exact shape rubash's windows_mnt_drive_argument accepts,
+  // so the two layers never drift (rubash#444, rubash#592). "/mnt/data",
+  // "/mnt/cfoo" and "/mnt/123" are ordinary POSIX words under a literal /mnt
+  // directory, bare /mnt (the WSL root) is never a drive, and without the
+  // separator check "/mntcc" would lexically fold to "/c" and name C:\.
+  constexpr std::wstring_view k_mnt_name = L"mnt";
+  if (normalized.size() >= k_mnt_name.size() + 3 &&
+      is_separator(normalized[0])) {
+    bool name_match = true;
+    for (size_t i = 0; i < k_mnt_name.size(); ++i) {
+      if (normalized[1 + i] != k_mnt_name[i]) {
+        name_match = false;
+        break;
+      }
+    }
+    const size_t drive_pos = k_mnt_name.size() + 2;
+    const wchar_t drive_ch = normalized[drive_pos];
+    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
+                              (drive_ch >= L'A' && drive_ch <= L'Z');
+    if (name_match && is_separator(normalized[k_mnt_name.size() + 1]) &&
+        drive_letter &&
+        (normalized.size() == drive_pos + 1 ||
+         is_separator(normalized[drive_pos + 1]))) {
+      return std::wstring(L"/").append(normalized.substr(drive_pos));
+    }
+  }
+  return std::nullopt;
+}
+
 // Fold the MSYS single-letter drive dialect onto its native spelling: "/e"
 // and "/e/Data" name "E:\" and "E:\Data". Every boundary that accepts a raw
 // POSIX spelling goes through this one helper so the recognition rule stays
@@ -370,67 +439,13 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
   // the MSYS spelling first keeps a single drive-letter branch below owning
   // every POSIX drive form (#1145).  Both separators are accepted anywhere
   // in the prefix: callers routinely hand this function already-preferred
-  // backslash forms (e.g. a "\cygdrive\d\src\*" enumeration pattern).
-  constexpr std::wstring_view k_cygdrive_name = L"cygdrive";
-  if (normalized.size() >= k_cygdrive_name.size() + 3 &&
-      is_separator(normalized[0])) {
-    bool name_match = true;
-    for (size_t i = 0; i < k_cygdrive_name.size(); ++i) {
-      wchar_t ch = normalized[1 + i];
-      if (ch >= L'A' && ch <= L'Z') {
-        ch = static_cast<wchar_t>(ch - L'A' + L'a');
-      }
-      if (ch != k_cygdrive_name[i]) {
-        name_match = false;
-        break;
-      }
-    }
-    const size_t drive_pos = k_cygdrive_name.size() + 2;
-    const wchar_t drive_ch = normalized[drive_pos];
-    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
-                              (drive_ch >= L'A' && drive_ch <= L'Z');
-    if (name_match && is_separator(normalized[1 + k_cygdrive_name.size()]) &&
-        drive_letter &&
-        (normalized.size() == drive_pos + 1 ||
-         is_separator(normalized[drive_pos + 1]))) {
-      normalized = L"/" + normalized.substr(drive_pos);
-    }
-  }
-  // WSL interop drive prefix: /mnt/X/... names the same file as /X/... and
-  // X:\... (#1172). WSL mounts the Windows drives under /mnt, so its spelling
-  // reaches argv verbatim whenever a WSL-side toolchain (or a script quoting
-  // WSL paths) hands this binary the operand directly - outside rubash, whose
-  // argv funnel already pre-translates the form for every child (rubash#444,
-  // rubash#592). Folding it to the MSYS spelling, like the cygdrive fold
-  // above, keeps the single drive-letter branch below owning every POSIX
-  // drive form. The prefix matches rubash's windows_mnt_drive_argument
-  // byte-for-byte so the two layers never drift: a lowercase "mnt" literal
-  // (the spelling WSL itself emits - unlike cygdrive, the name comparison is
-  // case-sensitive by contract), the literal separator after it, a drive
-  // letter of either case, and exactly /mnt/X or /mnt/X/...: "/mnt/data",
-  // "/mnt/cfoo" and "/mnt/123" are ordinary POSIX words under a literal /mnt
-  // directory, bare /mnt (the WSL root) is never a drive, and without the
-  // separator check "/mntcc" would lexically fold to "/c" and name C:\.
-  constexpr std::wstring_view k_mnt_name = L"mnt";
-  if (normalized.size() >= k_mnt_name.size() + 3 &&
-      is_separator(normalized[0])) {
-    bool name_match = true;
-    for (size_t i = 0; i < k_mnt_name.size(); ++i) {
-      if (normalized[1 + i] != k_mnt_name[i]) {
-        name_match = false;
-        break;
-      }
-    }
-    const size_t drive_pos = k_mnt_name.size() + 2;
-    const wchar_t drive_ch = normalized[drive_pos];
-    const bool drive_letter = (drive_ch >= L'a' && drive_ch <= L'z') ||
-                              (drive_ch >= L'A' && drive_ch <= L'Z');
-    if (name_match && is_separator(normalized[k_mnt_name.size() + 1]) &&
-        drive_letter &&
-        (normalized.size() == drive_pos + 1 ||
-         is_separator(normalized[drive_pos + 1]))) {
-      normalized = L"/" + normalized.substr(drive_pos);
-    }
+  // backslash forms (e.g. a "\cygdrive\d\src\*" enumeration pattern). The
+  // WSL interop prefix folds in the same step (#1172), and the recognition
+  // lives in the shared fold_posix_drive_prefix_w so canonicalize_path_w
+  // (#1246) runs a byte-identical sequence instead of diverging on the same
+  // spelling.
+  if (auto prefix = fold_posix_drive_prefix_w(normalized)) {
+    normalized = std::move(*prefix);
   }
   if (auto folded = fold_drive_dialect_w(normalized)) {
     normalized = std::move(*folded);
@@ -1071,10 +1086,22 @@ export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
   // drive forms for the same reason. A drive-form operand is native-dialect
   // input: it resolves to the native spelling and is not re-expressed as a
   // shell-namespace path afterwards.
-  if (auto folded = fold_drive_dialect_w(strip_trailing_separators(path))) {
+  // #1246: the /cygdrive/X (#1145) and /mnt/X (#1172) prefixes fold onto the
+  // single-letter spelling BEFORE that rule, mirroring the argv boundary's
+  // fold sequence byte-for-byte. Without the prefix fold the resolver and
+  // the argv boundary disagreed on the same spelling: stat/test -f folded
+  // "/cygdrive/e/f" to E:\f while realpath/readlink -f walked it verbatim
+  // (or mapped it under the shell root), so "test -f said yes, realpath said
+  // no" (#850 family). A prefix operand is native-dialect input just like a
+  // drive-form one: it folds to the native spelling and is never
+  // re-expressed as a shell-namespace path, with or without a shell root.
+  std::wstring operand(strip_trailing_separators(path));
+  if (auto prefix = fold_posix_drive_prefix_w(operand)) {
+    operand = std::move(*prefix);
+  }
+  if (auto folded = fold_drive_dialect_w(operand)) {
     effective = std::move(*folded);
-  } else if (auto mapped =
-                 shell_tree_to_native_w(strip_trailing_separators(path))) {
+  } else if (auto mapped = shell_tree_to_native_w(operand)) {
     shell_input = *mapped;
     effective = *mapped;
   }
