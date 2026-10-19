@@ -75,34 +75,82 @@ auto resolve_component(const std::string& path,
   return true;
 }
 
+// One resolution step over the folded native spelling: the cumulative
+// prefix to probe, and the component tail to display.
+struct WalkStep {
+  std::wstring prefix;
+  std::wstring name;
+};
+
+// Split the folded native spelling into incremental prefixes.
+// "E:\a\b" -> "E:\", "E:\a", "E:\a\b"; relative "a\b" -> "a", "a\b";
+// UNC "\\srv\share\x" -> "\\srv\share", "\\srv\share\x"; a POSIX-rooted
+// spelling that no fold claimed ("/usr/bin") roots at "/".
+auto native_walk_steps(std::wstring_view native) -> std::vector<WalkStep> {
+  const auto is_sep = [](wchar_t ch) { return ch == L'/' || ch == L'\\'; };
+  const auto is_letter = [](wchar_t ch) {
+    return (ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z');
+  };
+  std::vector<WalkStep> steps;
+  if (native.empty()) return steps;
+
+  size_t pos = 0;
+  if (native.size() >= 2 && native[1] == L':' && is_letter(native[0])) {
+    // Drive-rooted native form ("E:\..." from the fold, or the Windows
+    // spelling as typed): the root step is the unambiguous "E:\", never the
+    // drive-relative "E:" (which would track the per-drive current
+    // directory). A bare "E:" operand stays one step.
+    pos = (native.size() > 2 && is_sep(native[2])) ? 3 : 2;
+    std::wstring root(native.substr(0, pos));
+    steps.push_back({root, root});
+  } else if (is_sep(native[0])) {
+    if (native.size() >= 2 && is_sep(native[1])) {
+      // UNC: "\\<server>\<share>" is the root component.
+      size_t p = 2;
+      while (p < native.size() && !is_sep(native[p])) ++p;
+      if (p < native.size()) {
+        ++p;
+        while (p < native.size() && !is_sep(native[p])) ++p;
+      }
+      pos = p;
+    } else {
+      pos = 1;
+    }
+    std::wstring root(native.substr(0, pos));
+    steps.push_back({root, root});
+  }
+
+  std::wstring prefix;
+  while (pos < native.size()) {
+    while (pos < native.size() && is_sep(native[pos])) ++pos;
+    const size_t start = pos;
+    while (pos < native.size() && !is_sep(native[pos])) ++pos;
+    if (start == pos) break;
+    prefix = std::wstring(native.substr(0, pos));
+    steps.push_back({prefix, std::wstring(native.substr(start, pos - start))});
+  }
+  return steps;
+}
+
 auto run(const Config& cfg) -> int {
   for (const auto& path : cfg.paths) {
     safePrintLn("");
     safePrintLn(path);
 
-    // Split into components
-    SmallVector<std::string, 16> parts;
-    size_t start = 0;
-    while (start <= path.size()) {
-      size_t pos = path.find_first_of("/\\", start);
-      if (pos == std::string::npos) {
-        std::string part = path.substr(start);
-        if (!part.empty()) parts.push_back(part);
-        break;
-      }
-      std::string part = path.substr(start, pos - start);
-      if (!part.empty()) parts.push_back(part);
-      start = pos + 1;
-    }
+    // #1237: the operand may use any accepted POSIX drive spelling
+    // ("/e/Data", "/cygdrive/e/Data", "/mnt/e/Data").  Probing the raw
+    // text's components with GetFileAttributesW resolved every one of them
+    // against the CURRENT drive, so all dialect forms reported a broken
+    // chain.  The operand folds once through the shared make_api_path_operand
+    // boundary and the walk runs on the folded native spelling; the header
+    // above still prints the operand exactly as the user typed it.
+    const auto operand = native_path::make_api_path_operand(path);
 
-    // Walk path component by component
-    std::string current = "";
-    for (size_t i = 0; i < parts.size(); ++i) {
-      if (!current.empty() && current.back() != '/' && current.back() != '\\')
-        current += "/";
-      current += parts[i];
-
-      if (i == 0 && parts[0].empty()) continue;
+    const auto steps = native_walk_steps(operand.normalized);
+    for (size_t i = 0; i < steps.size(); ++i) {
+      const auto& step = steps[i];
+      const std::string current = wstring_to_utf8(step.prefix);
+      const std::wstring& part = step.name;
 
       std::optional<std::string> target;
       bool is_file = resolve_component(current, target);
@@ -111,7 +159,7 @@ auto run(const Config& cfg) -> int {
         safePrint("   ");
         for (int j = 0; j < (int)i - 1; j++) safePrint(" ");
         safePrint("f ");
-        safePrint(parts[i]);
+        safePrint(part);
         safePrintLn(" (No such file or directory)");
         break;
       }
@@ -122,12 +170,8 @@ auto run(const Config& cfg) -> int {
       if (target.has_value()) {
         // Symlink detected
         safePrint("s ");
-        safePrint(parts[i]);
+        safePrint(part);
         safePrintLn(" -> " + *target);
-      } else if (target.has_value()) {
-        safePrint("L ");
-        safePrint(parts[i]);
-        safePrintLn("");
       } else {
         // Regular file/dir
         std::wstring wcur = utf8_to_wstring(current);
@@ -138,7 +182,7 @@ auto run(const Config& cfg) -> int {
         } else {
           safePrint("d ");
         }
-        safePrint(parts[i]);
+        safePrint(part);
         safePrintLn("");
       }
     }

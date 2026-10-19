@@ -486,23 +486,40 @@ auto execute_tree(const CommandContext<TREE_OPTIONS.size()> &ctx)
 
   // Get target directories (default to current directory)
   std::vector<std::wstring> target_dirs;
+  std::vector<std::wstring> target_spellings;
   for (auto arg : ctx.positionals) {
-    target_dirs.push_back(utf8_to_wstring(std::string(arg)));
+    // #1236: the operand may use any accepted POSIX drive spelling
+    // ("/e/Data", "/cygdrive/e/Data", "/mnt/e/Data").  Handing that raw
+    // text to GetFullPathNameW makes Win32 resolve a leading "/e" against
+    // the CURRENT drive, so from a C: cwd `tree /e/Data` rejected a
+    // directory that exists on E: - or silently listed the shadow
+    // "C:\e\Data" where one happened to exist.  The operand folds once
+    // through the shared normalize_api_operand boundary before any Win32
+    // call; the verbatim spelling is kept apart for the error message
+    // below, which prints what the user typed (#1234 display/fold split).
+    std::string spelling(arg);
+    target_spellings.push_back(utf8_to_wstring(spelling));
+    target_dirs.push_back(
+        utf8_to_wstring(native_path::normalize_api_operand(spelling)));
   }
 
   if (target_dirs.empty()) {
     target_dirs.push_back(L".");
+    target_spellings.push_back(L".");
   }
 
   // Process each directory
-  for (const auto &dir_path : target_dirs) {
+  for (size_t index = 0; index < target_dirs.size(); ++index) {
+    const std::wstring &dir_path = target_dirs[index];
+    const std::wstring &spelling = target_spellings[index];
     std::wstring abs_path;
     if (dir_path == L".") {
       wchar_t buffer[MAX_PATH];
       GetCurrentDirectoryW(MAX_PATH, buffer);
       abs_path = buffer;
     } else {
-      // Get full path
+      // Get full path (the folded operand is already native, so this only
+      // completes a relative spelling against the cwd)
       wchar_t buffer[MAX_PATH];
       GetFullPathNameW(dir_path.c_str(), MAX_PATH, buffer, nullptr);
       abs_path = buffer;
@@ -521,11 +538,13 @@ auto execute_tree(const CommandContext<TREE_OPTIONS.size()> &ctx)
     // Check if path exists
     DWORD attrs = GetFileAttributesW(abs_path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) {
+      // [GNU] the message quotes the operand as typed, never the folded
+      // native form (MSYS prints the user's spelling, #1234 nit precedent).
       if (output_to_file) {
-        file_output << "tree: cannot access '" << wstring_to_utf8(abs_path)
+        file_output << "tree: cannot access '" << wstring_to_utf8(spelling)
                     << "': No such file or directory" << std::endl;
       } else {
-        safePrintLn(L"tree: cannot access '" + abs_path +
+        safePrintLn(L"tree: cannot access '" + spelling +
                     L"': No such file or directory");
       }
       return false;

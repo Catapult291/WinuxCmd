@@ -2252,6 +2252,146 @@ TEST(wpm, wpm_apply_update_installs_the_forwarder) {
                                        L"winuxcmd-shim.exe"));
 }
 
+namespace {
+
+// An index with `git` forwarding to `target`, plus a cycle and a dangling alias.
+std::string alias_fixture_index_json(const std::filesystem::path& artifact_path) {
+  return std::string("{\n"
+                     "  \"schema\": 1,\n"
+                     "  \"name\": \"fixture\",\n"
+                     "  \"version\": \"fixture-alias\",\n"
+                     "  \"packages\": [\n"
+                     "    {\"name\":\"target\",\"version\":\"1.0.0\","
+                     "\"description\":\"alias target\",\"kind\":\"external\","
+                     "\"commands\":[\"tool\"],\"artifacts\":{\"") +
+         std::string(current_arch_key()) +
+         "\":{\"type\":\"exe\","
+         "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38a1e090a"
+         "f291226f322\",\"urls\":[\"" +
+         file_url(artifact_path) +
+         "\"],\"files\":[{\"from\":\"tool.exe\",\"to\":\"tool.exe\"}]}}},\n"
+         "    {\"name\":\"git\",\"version\":\"2.0.0\","
+         "\"description\":\"alias of target\",\"kind\":\"external\","
+         "\"alias_of\":\"target\"},\n"
+         "    {\"name\":\"loop-a\",\"version\":\"1.0.0\","
+         "\"alias_of\":\"loop-b\"},\n"
+         "    {\"name\":\"loop-b\",\"version\":\"1.0.0\","
+         "\"alias_of\":\"loop-a\"},\n"
+         "    {\"name\":\"dangling\",\"version\":\"1.0.0\","
+         "\"alias_of\":\"not-in-this-index\"}\n"
+         "  ]\n"
+         "}\n";
+}
+
+}  // namespace
+
+TEST(wpm, wpm_shim_map_points_at_a_non_conventional_payload) {
+  // A payload that must keep its own directory layout (codex ships
+  // bin/codex.exe beside codex-resources/) declares its destination in `files`;
+  // the shim map has to follow that, not the opt/<pkg>/<cmd>.exe convention.
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write("fixture-nested-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-nested-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"nested shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" + file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"bin/tool.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-nested-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+
+  const auto map = tmp.read(".wpm/shims.map");
+  EXPECT_CONTAINS(map, "tool=opt");
+  EXPECT_CONTAINS(map, "bin");
+  EXPECT_TRUE(std::filesystem::exists(tmp.path / L"opt" / L"tool" / L"bin" /
+                                      L"tool.exe"));
+}
+
+TEST(wpm, wpm_install_follows_a_package_alias) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write(".wpm/indexes/official.json", alias_fixture_index_json(artifact_path));
+
+  // `wpm install git` installs what `git` forwards to, and says so (#1218).
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"git", L"--root", tmp.wpath()});
+  auto r = install.run();
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stdout_text, "is provided by 'target'");
+  EXPECT_EQ(tmp.read("usr/bin/tool.exe"), "external exe\n");
+
+  // `info` shows the forwarding too.
+  Pipeline info;
+  info.add(L"winuxcmd.exe", {L"wpm", L"info", L"git", L"--root", tmp.wpath()});
+  auto info_result = info.run();
+  EXPECT_EQ(info_result.exit_code, 0);
+  EXPECT_CONTAINS(info_result.stdout_text, "Alias of: target");
+}
+
+TEST(wpm, wpm_install_rejects_alias_cycles_and_missing_targets) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write(".wpm/indexes/official.json", alias_fixture_index_json(artifact_path));
+
+  Pipeline cycle;
+  cycle.add(L"winuxcmd.exe",
+            {L"wpm", L"install", L"loop-a", L"--root", tmp.wpath()});
+  auto cycle_result = cycle.run();
+  EXPECT_NE(cycle_result.exit_code, 0);
+  EXPECT_CONTAINS(cycle_result.stderr_text, "alias cycle");
+  EXPECT_CONTAINS(cycle_result.stderr_text, "loop-a -> loop-b -> loop-a");
+
+  Pipeline dangling;
+  dangling.add(L"winuxcmd.exe",
+               {L"wpm", L"install", L"dangling", L"--root", tmp.wpath()});
+  auto dangling_result = dangling.run();
+  EXPECT_NE(dangling_result.exit_code, 0);
+  EXPECT_CONTAINS(dangling_result.stderr_text, "is not in the index");
+}
+
 TEST(wpm, wpm_outdated_uses_receipt_version_after_index_update) {
   TempDir tmp;
   const auto artifact_path = tmp.path / L"source" / L"jq.exe";
