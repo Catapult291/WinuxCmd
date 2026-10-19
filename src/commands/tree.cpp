@@ -472,7 +472,16 @@ auto execute_tree(const CommandContext<TREE_OPTIONS.size()> &ctx)
   std::ofstream file_output;
 
   if (output_to_file) {
-    std::wstring woutput_file = utf8_to_wstring(cfg.output_file);
+    // #1254: the write side folds through the same shared boundary as the
+    // read-side root above (#1236). Handing the raw "/e/..." text to
+    // ofstream makes Win32 resolve a leading "/e" against the CURRENT drive,
+    // so from a foreign cwd `tree -o /e/probe/out.txt` opened (or failed to
+    // open) a shadow file on the cwd's drive instead of the named one. The
+    // verbatim spelling is kept for the error message (#1234 display/fold
+    // split), like the read side does.
+    const std::string normalized_output =
+        native_path::normalize_api_operand(cfg.output_file);
+    std::wstring woutput_file = utf8_to_wstring(normalized_output);
     // [#1214] std::ofstream defaults to text mode on Windows, so every '\n'
     // written through << std::endl became CRLF and `tree -o FILE` did not
     // match GNU tree (or tree's own stdout, which goes through safePrint and

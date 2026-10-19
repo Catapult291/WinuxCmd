@@ -497,3 +497,85 @@ TEST(tree, tree_missing_dir_error_quotes_operand_spelling) {
   EXPECT_CONTAINS(r.stdout_text,
                   "cannot access '" + tree_dialect_detail::utf8(operand) + "'");
 }
+
+// ===== #1254 regression: the -o output operand folds like the read side =====
+//
+// The root operand folds through the shared normalize_api_operand boundary
+// since #1236, but the -o file operand went to ofstream as raw text. Win32
+// resolves a leading "/e" against the CURRENT drive, so from a foreign cwd
+// `tree -o /e/probe/out.txt` opened a shadow "<cwd-drive>:\e\probe\out.txt"
+// (or failed outright) instead of writing on the named drive. The output
+// operand now folds through the same boundary; the error message keeps the
+// spelling as typed.
+
+TEST(tree, tree_output_operand_dialect_lands_on_operand_drive) {
+  TempDir tmp;
+  const wchar_t other = tree_dialect_detail::other_fixed_drive(
+      tree_dialect_detail::drive_letter(tmp.path));
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+
+  const std::wstring native_out = tmp.wpath() + L"\\wb-out.txt";
+  const std::wstring drive_operand =
+      tree_dialect_detail::slash_drive_form(tmp.path) + L"/wb-out.txt";
+  const std::wstring cygdrive_operand =
+      tree_dialect_detail::cygdrive_form(tmp.path) + L"/wb-out.txt";
+  const std::wstring mnt_operand =
+      tree_dialect_detail::mnt_form(tmp.path) + L"/wb-out.txt";
+
+  for (const std::wstring operand :
+       {drive_operand, cygdrive_operand, mnt_operand}) {
+    // Foreign cwd: the audit's shadow shape - cwd on one drive, operand on
+    // another. The listed directory is the small tmp dir on its own drive.
+    Pipeline p;
+    p.set_cwd(std::wstring(1, other) + L":\\");
+    tree_dialect_detail::clear_shell_root_env(p);
+    p.add(L"tree.exe", {L"-o", operand,
+                        tree_dialect_detail::slash_drive_form(tmp.path)});
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("tree.exe", L"-o", operand,
+                      tree_dialect_detail::slash_drive_form(tmp.path));
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("tree -o dialect stdout", r.stdout_text);
+
+    // Before #1254 the ofstream landed on the cwd drive (shadow) or failed
+    // to open; the file must exist at the operand's own native location.
+    EXPECT_EQ(r.exit_code, 0);
+    const std::string bytes = tmp.read("wb-out.txt");
+    TEST_LOG("tree -o dialect file bytes", bytes);
+    EXPECT_TRUE(bytes.find("directories, ") != std::string::npos);
+
+    // Shadow negative: the pre-#1254 resolution of the operand against the
+    // cwd drive must not have been written.
+    const std::wstring shadow = std::wstring(1, other) + L":" + operand;
+    const DWORD shadow_attrs = GetFileAttributesW(shadow.c_str());
+    EXPECT_TRUE(shadow_attrs == INVALID_FILE_ATTRIBUTES);
+
+    DeleteFileW(native_out.c_str());
+  }
+}
+
+TEST(tree, tree_output_operand_open_failure_quotes_operand_spelling) {
+  TempDir tmp;
+  const std::wstring operand = tree_dialect_detail::slash_drive_form(tmp.path) +
+                               L"/absent-dir1254/out.txt";
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  tree_dialect_detail::clear_shell_root_env(p);
+  p.add(L"tree.exe", {L"-o", operand, L"."});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("tree.exe", L"-o", operand, L".");
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("tree -o open failure stderr", r.stderr_text);
+
+  // [GNU] the message quotes the operand spelling as typed (#1234 split).
+  EXPECT_NE(r.exit_code, 0);
+  EXPECT_CONTAINS(r.stderr_text,
+                  "cannot open output file: " +
+                      tree_dialect_detail::utf8(operand));
+}

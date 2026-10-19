@@ -151,7 +151,20 @@ auto read_lines(const std::string& filename, std::vector<std::string>& out)
   data.resize(got);
 
   size_t start = 0;
-  while (start <= data.size()) {
+  // #1251: a final newline at EOF must not synthesize a phantom empty entry.
+  // The loop below ends when `start` reaches the data size, so the text after
+  // the last '\n' is emitted only when it is non-empty: "…charlie\ndelta\n"
+  // yields exactly the four real words. The phantom used to enter the binary
+  // search as an "" entry, which sorts before every key while sitting at the
+  // END of the (sorted) array — a midpoint landing on it pushed lower_bound
+  // past the last real word and `look -f delt` printed nothing for a
+  // dictionary that ends "…charlie\ndelta\n". Oracle: util-linux look 2.39.3
+  // (WSL) prints "delta" for the trailing-newline form, prints every word and
+  // no trailing empty line for `look ''`, and treats a lone "\n" file as ONE
+  // empty entry — exactly the shapes this loop now produces. Empty lines in
+  // the MIDDLE of the dictionary keep their existing behavior (real entries,
+  // matched by an empty key): GNU look tolerates them the same way.
+  while (start < data.size()) {
     size_t nl = data.find('\n', start);
     if (nl == std::string::npos) {
       out.emplace_back(data.substr(start));

@@ -139,6 +139,36 @@ repository release tags.
   boundary (ls, du, sed, cp, ...) picks the form up at once; under a
   configured shell root the resolution is unchanged, since the niubash#346
   shell-ns arm already mapped this exact shape.
+- **realpath/readlink/stat**: the shared resolver behind `realpath`,
+  `readlink -f/-e/-m` and `stat -L` folded only the single-letter drive
+  form, so `/cygdrive/e/...` and `/mnt/e/...` stranded on the current drive
+  (or, with a shell root configured, mapped under the shell tree) while the
+  same spelling folded correctly for stat/test -f at the argv boundary -
+  "test -f said yes, realpath said no" for one and the same operand
+  (#1246, the #850 family, confirmed by the #1245 review). The resolver now
+  runs the cygdrive (#1145) and /mnt (#1172) prefix folds before the
+  single-letter rule, in the exact order the argv boundary does, so every
+  command answers one spelling identically; a folded prefix operand is
+  native-dialect input and is never re-expressed as a shell-namespace path.
+  stat itself routes its operand through the shared argv boundary since
+  #1245, which also made shell-namespace spellings (`stat /usr/bin` under a
+  configured shell root) resolve like ls and readlink -f instead of
+  reporting ENOENT.
+- **look**: a dictionary ending in a final newline carried a phantom empty
+  entry at the END of the sorted line array, and the binary search's
+  midpoint could land on it - an empty string sorts before every key - so
+  lower_bound jumped past the last real word and `look -f delt` printed
+  nothing for a dictionary ending "…charlie\ndelta\n" (#1251). The final
+  newline at EOF no longer synthesizes an entry (matching util-linux look,
+  which also treats a lone "\n" file as exactly one empty entry); empty
+  lines in the middle of the dictionary keep working as real entries.
+- **tree**: the `-o` output operand did not fold through the shared
+  `normalize_api_operand` boundary, so `tree -o /e/probe/out.txt` from a
+  foreign cwd opened a shadow `C:\e\probe\out.txt` on the cwd's drive - or
+  failed to open at all - instead of writing on the named drive (#1254,
+  the write-side follow-up to #1236). The output operand folds once like
+  the root operand; the open-failure message keeps quoting the spelling as
+  typed.
 
 ## [1.1.14] - 2026-10-17
 
