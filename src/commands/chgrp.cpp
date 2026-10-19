@@ -173,7 +173,13 @@ auto format_missing_reference_error(const std::string& path, DWORD error)
 }
 
 auto get_group_info_for_path(const std::string& path) -> GroupInfo {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1241: the operand may use any accepted POSIX drive spelling.  Win32
+  // resolves a leading "/e" against the CURRENT drive, so an unfolded
+  // GetNamedSecurityInfoW answered for "<cwd>:\e\..." whenever the cwd sat
+  // on another drive.  Fold through the shared boundary first; callers keep
+  // quoting the user's spelling in messages.
+  std::wstring wpath =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
   PSECURITY_DESCRIPTOR security_desc = nullptr;
   PSID group_sid = nullptr;
 
@@ -260,7 +266,20 @@ auto get_volume_root_path(const std::wstring& full_path) -> std::wstring {
 
 auto get_preserve_root_match(const std::string& input_path)
     -> std::optional<PreserveRootMatch> {
-  std::wstring full_path = get_full_path(utf8_to_wstring(input_path));
+  // #1241: fold the drive dialect first — "/e" names E:\, and an unfolded
+  // GetFullPathNameW resolved it against the CURRENT drive, so
+  // `chgrp -R --preserve-root /e` from a C: cwd compared "C:\e" against the
+  // "C:\" volume root, missed the failsafe and descended into "<cwd>:\e".
+  // An all-separator spelling ("/") stays verbatim: normalize_api_operand
+  // resolves it through the shell tree, and that native root is not the
+  // volume root this failsafe has to match.
+  const bool all_separators =
+      !input_path.empty() &&
+      input_path.find_first_not_of("/\\") == std::string::npos;
+  const std::string folded =
+      all_separators ? input_path
+                     : native_path::normalize_api_operand(input_path);
+  std::wstring full_path = get_full_path(utf8_to_wstring(folded));
   if (full_path.empty()) {
     return std::nullopt;
   }
@@ -309,7 +328,10 @@ auto build_config(const CommandContext<CHGRP_OPTIONS.size()>& ctx)
       cfg.files.push_back(std::string(ctx.positionals[i]));
     }
   } else {
-    std::wstring wref = utf8_to_wstring(cfg.reference_file);
+    // #1241: fold the drive dialect before the reference probe; the error
+    // keeps the user's spelling (display strings ride alongside API forms).
+    const std::wstring wref =
+        utf8_to_wstring(native_path::normalize_api_operand(cfg.reference_file));
     if (GetFileAttributesW(wref.c_str()) == INVALID_FILE_ATTRIBUTES) {
       return std::unexpected(
           format_missing_reference_error(cfg.reference_file, GetLastError()));
@@ -368,7 +390,11 @@ auto change_group(const std::string& file, const std::string& group_name,
   // For now, we warn that this is a Windows-specific limitation
 
   // Convert to wide strings
-  std::wstring wfile = utf8_to_wstring(file);
+  // #1241: fold the drive dialect before the Win32 security call so the group
+  // change lands on the operand's drive instead of "<cwd>:\e\..." (#1233
+  // precedent).  `file` stays verbatim in the messages below.
+  std::wstring wfile =
+      utf8_to_wstring(native_path::normalize_api_operand(file));
   std::wstring wgroup = utf8_to_wstring(group_name);
 
   // Lookup the group SID
@@ -446,9 +472,14 @@ auto process_file(const std::string& file, const Config& cfg) -> bool {
   return change_group(file, cfg.group, cfg);
 }
 
-auto process_directory(const std::wstring& path, const Config& cfg) -> bool {
+auto process_directory(const std::string& path, const Config& cfg) -> bool {
+  // #1241: PATH is the display spelling (what the user typed, or a child
+  // built from it); fold once here for the enumeration API and let
+  // change_group re-fold each child, so the messages keep the user's
+  // spelling (chmod -R precedent).
+  const auto operand = native_path::make_api_path_operand(path);
   WIN32_FIND_DATAW find_data;
-  std::wstring search_path = path + L"\\*";
+  std::wstring search_path = operand.extended + L"\\*";
   HANDLE hFind = FindFirstFileW(search_path.c_str(), &find_data);
 
   if (hFind == INVALID_HANDLE_VALUE) return true;
@@ -458,13 +489,12 @@ auto process_directory(const std::wstring& path, const Config& cfg) -> bool {
     std::wstring name = find_data.cFileName;
     if (name == L"." || name == L"..") continue;
 
-    std::wstring full_path = path + L"\\" + name;
-    std::string full_path_utf8 = wstring_to_utf8(full_path);
+    std::string full_path_utf8 = path + "\\" + wstring_to_utf8(name);
 
     if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       change_group(full_path_utf8, cfg.group, cfg);
       if (cfg.recursive) {
-        process_directory(full_path, cfg);
+        process_directory(full_path_utf8, cfg);
       }
     } else {
       if (!change_group(full_path_utf8, cfg.group, cfg)) {
@@ -499,8 +529,11 @@ auto run(const Config& cfg) -> int {
       }
     }
 
-    std::wstring wfile = utf8_to_wstring(file);
-    DWORD attrs = GetFileAttributesW(wfile.c_str());
+    // #1241: fold the drive dialect before the attribute probe; an unfolded
+    // GetFileAttributesW answered for "<cwd>:\e\..." and existing E: files
+    // were reported as missing whenever the cwd sat on another drive.
+    DWORD attrs = native_path::operand_target_attributes_w(
+        native_path::make_api_path_operand(file));
 
     if (attrs == INVALID_FILE_ATTRIBUTES) {
       if (!cfg.silent) {
@@ -520,7 +553,7 @@ auto run(const Config& cfg) -> int {
 
     // If recursive and directory, process contents
     if (cfg.recursive && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-      if (!process_directory(wfile, cfg)) {
+      if (!process_directory(file, cfg)) {
         success = false;
       }
     }
