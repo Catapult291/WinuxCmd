@@ -4,6 +4,35 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
+## [Unreleased]
+
+### Fixed
+
+- **mkfifo / mknod**: FIFO/device-node path operands resolved against the
+  cwd drive (#1235, #1230 sweep). The raw `/e/p` spelling reached the
+  existence probe and `create_winux_fifo_w`, and Win32 roots a leading `/e`
+  on the CURRENT drive, so from a `C:` cwd `mkfifo /e/p` probed
+  `<cwd>:\e\p` (ENOENT for a real `E:\p`) and would have landed the marker
+  beside the cwd; `mknod /e p` from a `D:` cwd really created a `D:\e`
+  marker file. Operands now fold once through the shared
+  `make_api_path_operand` boundary before any filesystem call;
+  `/cygdrive/e`, `/mnt/e` and bare `/e` (which now reports "File exists"
+  like MSYS) share the fold, and messages keep the operand spelling as
+  typed.
+- **chgrp / chown / chcon**: `--reference` and target file operands
+  resolved against the cwd drive (#1241, same sweep). An unfolded
+  `/e/...` spelling made `GetFileAttributesW` /
+  `GetNamedSecurityInfoW` / the `WRITE_OWNER` open answer for
+  `<cwd>:\e\...`, so existing `E:` files were reported as missing from
+  any other cwd, `chgrp -R --preserve-root /e` missed the failsafe and
+  descended into `<cwd>:\e`, and chown/chcon globs enumerated the wrong
+  drive. Security lookups, attribute probes, the recursive walks and the
+  glob pattern all fold through the shared boundary first (children
+  re-fold from their display spelling, chmod `-R` precedent); error text
+  keeps the user's spelling. An all-separator operand (`/`) stays
+  verbatim in the preserve-root failsafe, whose volume-root comparison
+  must keep seeing the cwd drive.
+
 ## [1.1.17] - 2026-10-19
 
 ### Added
