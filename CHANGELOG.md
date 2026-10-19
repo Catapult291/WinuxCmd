@@ -4,7 +4,18 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
-## [Unreleased]
+## [1.1.17] - 2026-10-19
+
+### Added
+
+- **wpm**: a package entry can be an alias for another one (`alias_of`), so one
+  tool has one name - `wpm install git` installs `niugit` and says so, with a
+  depth bound, a cycle detector and a clear error when the target is missing.
+  `wpm info` shows the forwarding; `wpm list` labels such an entry `alias`.
+- **wpm**: a `layout: shim` command's payload is resolved from the artifact's
+  `files` mapping when it is not at the `opt/<pkg>/<command>.exe` convention, so
+  a payload that has to keep its own directory layout (an executable beside its
+  resource directories) gets a shim that can find it.
 
 ### Fixed
 
