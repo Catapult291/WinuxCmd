@@ -649,3 +649,241 @@ TEST(chown, chown_without_h_cannot_dereference_dangling_symlink) {
   EXPECT_NE(r.stderr_text.find("cannot dereference 'dangling.txt'"),
             std::string::npos);
 }
+
+// ===== #1241 regression: POSIX drive-dialect operands =====
+// chown resolved '--reference' and target operands raw: an unfolded "/e/..."
+// spelling makes Win32 answer for "<cwd>:\e\..." so the reference lookup
+// failed and existing E: files were reported as missing whenever the cwd sat
+// on another drive. The probes synthesize the dialect spelling from the
+// TempDir's own drive so they pass on any host.
+namespace chown_dialect_detail {
+
+auto drive_letter(const std::filesystem::path& path) -> wchar_t {
+  wchar_t drive = path.wstring()[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  return drive;
+}
+
+auto slash_drive_form(const std::filesystem::path& path) -> std::wstring {
+  std::wstring text = path.wstring();
+  text[0] = drive_letter(path);
+  text.erase(1, 1);  // drop the ':' from "c:\..." (MSYS spelling has none)
+  for (wchar_t& ch : text) {
+    if (ch == L'\\') ch = L'/';
+  }
+  return L"/" + text;
+}
+
+auto other_fixed_drive(wchar_t other) -> wchar_t {
+  const DWORD mask = GetLogicalDrives();
+  for (wchar_t letter = L'A'; letter <= L'Z'; ++letter) {
+    if ((mask & (1u << (letter - L'A'))) == 0) continue;
+    if (letter == other) continue;
+    if (GetDriveTypeW((std::wstring(1, letter) + L":\\").c_str()) !=
+        DRIVE_FIXED) {
+      continue;
+    }
+    return letter;
+  }
+  return L'\0';
+}
+
+auto utf8(const std::wstring& text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+}  // namespace chown_dialect_detail
+
+TEST(chown, chown_reference_drive_dialect_resolves_operand_file) {
+  TempDir tmp;
+  tmp.write("g1235", "probe");
+  const std::wstring operand =
+      chown_dialect_detail::slash_drive_form(tmp.path / L"g1235");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"chown.exe", {L"-v", L"--reference=" + operand, operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-v", L"--reference=" + operand, operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  // Parse-layer verdict: the reference and the target resolve, so the
+  // no-op --reference form reports "retained" and succeeds (no security
+  // state is modified).
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(
+      r.stderr_text.find("ownership of '" +
+                         chown_dialect_detail::utf8(operand) + "' retained as"),
+      std::string::npos);
+}
+
+TEST(chown, chown_reference_drive_dialect_cwd_on_other_drive_resolves_operand) {
+  TempDir tmp;
+  tmp.write("g1235", "probe");
+  const wchar_t other = chown_dialect_detail::other_fixed_drive(
+      chown_dialect_detail::drive_letter(tmp.path));
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+  const std::wstring operand =
+      chown_dialect_detail::slash_drive_form(tmp.path / L"g1235");
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, other) + L":\\");
+  p.add(L"chown.exe", {L"-v", L"--reference=" + operand, operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-v", L"--reference=" + operand, operand);
+  TEST_LOG_EXIT_CODE(r);
+
+  // The audit's exact misparse: from another drive the raw spelling probed
+  // "<cwd>:\e\..." and reported the existing file as missing.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stderr_text.find("retained as"), std::string::npos);
+  EXPECT_EQ(r.stderr_text.find("failed to get attributes"), std::string::npos);
+}
+
+TEST(chown, chown_reference_missing_file_quotes_operand_spelling) {
+  TempDir tmp;
+  tmp.write("g1235", "probe");
+  const std::wstring missing =
+      chown_dialect_detail::slash_drive_form(tmp.path / L"nope1235");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"chown.exe",
+        {L"-v", L"--reference=" + missing,
+         chown_dialect_detail::slash_drive_form(tmp.path / L"g1235")});
+
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("failed to get attributes of '" +
+                               chown_dialect_detail::utf8(missing) + "'"),
+            std::string::npos);
+  EXPECT_EQ(r.stderr_text.find("X:\\"), std::string::npos);
+}
+
+TEST(chown, chown_recursive_reference_drive_dialect_walks_operand_drive) {
+  TempDir tmp;
+  tmp.write("d1235/inner1235", "probe");
+  const std::wstring operand =
+      chown_dialect_detail::slash_drive_form(tmp.path / L"d1235");
+  const wchar_t tmp_drive = chown_dialect_detail::drive_letter(tmp.path);
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"chown.exe",
+        {L"-R", L"-H", L"-v", L"--reference=" + operand, operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-R", L"-H", L"-v", L"--reference=" + operand,
+                    operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stderr_text.find("retained as"), std::string::npos);
+  EXPECT_FALSE(std::filesystem::exists(
+      std::filesystem::path(std::wstring(1, tmp_drive) + L":\\e")));
+}
+
+// ===== CR-on-#1249 regression: root spellings the operand layer collapses
+// ===== The operand layer folds "//" and "///" onto "/" (ls -id / // reports
+// one inode), but a verbatim GetFullPathNameW("//") answers for an UNC-ish
+// name, so keeping those spellings verbatim in the failsafe comparison let
+// `chown -R --preserve-root X //` bypass the check and really modify group
+// ownership under the shell root.  They must hit the root match directly;
+// MSYS pins the texts below ("on '//'" with no suffix).
+namespace chown_root_spelling_detail {
+
+auto narrow(const std::wstring& text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+}  // namespace chown_root_spelling_detail
+
+TEST(chown, chown_preserve_root_all_separator_spellings_are_rejected) {
+  for (const std::wstring operand : {L"//", L"///"}) {
+    Pipeline p;
+    p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", operand});
+
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users",
+                      operand);
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("chown stderr", r.stderr_text);
+
+    EXPECT_EQ(r.exit_code, 1);
+    EXPECT_NE(
+        r.stderr_text.find("it is dangerous to operate recursively on '" +
+                           chown_root_spelling_detail::narrow(operand) + "'"),
+        std::string::npos);
+    EXPECT_NE(r.stderr_text.find("use --no-preserve-root"), std::string::npos);
+  }
+}
+
+TEST(chown, chown_preserve_root_double_slash_component_spelling_is_refused) {
+  // "//e/.." roots at "//e" (POSIX two-slash rule): MSYS resolves it against
+  // that name and reports "cannot access", and so must we - no root match,
+  // no descent.
+  Pipeline p;
+  p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", L"//e/.."});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users",
+                    L"//e/..");
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_EQ(r.stderr_text.find("it is dangerous"), std::string::npos);
+  EXPECT_NE(r.stderr_text.find("cannot access '//e/..'"), std::string::npos);
+}
+
+TEST(chown, chown_preserve_root_dotdot_collapse_spelling_is_rejected) {
+  // "/e/.." lexically collapses onto the root; MSYS fires the failsafe with
+  // the "(same as '/')" suffix.  Purely lexical, so the drive need not
+  // exist.
+  Pipeline p;
+  p.add(L"chown.exe", {L"-R", L"--preserve-root", L"Users", L"/e/.."});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("chown.exe", L"-R", L"--preserve-root", L"Users", L"/e/..");
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("chown stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("it is dangerous to operate recursively on "
+                               "'/e/..' (same as '/')"),
+            std::string::npos);
+  EXPECT_NE(r.stderr_text.find("use --no-preserve-root"), std::string::npos);
+}

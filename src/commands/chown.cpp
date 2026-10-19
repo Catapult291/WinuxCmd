@@ -201,11 +201,14 @@ auto copy_sid_bytes(PSID sid) -> std::vector<std::byte> {
 
 // Fetch owner/group SIDs of the link itself via an OPEN_REPARSE_POINT
 // handle; works on dangling symlinks where the named variant follows the
-// link and fails.
+// link and fails.  The operand is folded through the shared boundary first
+// (#1241): a raw "/e/..." spelling makes Win32 resolve against the CURRENT
+// drive, so the handle opened for "<cwd>:\e\...".
 auto get_sids_for_link(const std::wstring& wpath) -> PathSids {
   PathSids result;
+  const std::wstring folded = native_path::normalize_api_operand_w(wpath);
   HANDLE handle = CreateFileW(
-      wpath.c_str(), READ_CONTROL,
+      folded.c_str(), READ_CONTROL,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
       nullptr);
@@ -232,15 +235,17 @@ auto get_sids_for_link(const std::wstring& wpath) -> PathSids {
 }
 
 // Fetch the file object owner/group SIDs without following the final
-// component's symbolic link.
+// component's symbolic link.  The operand is folded through the shared
+// boundary first (#1241, same rule as get_sids_for_link).
 auto get_sids_for_path(const std::wstring& wpath) -> PathSids {
   PathSids result;
   PSECURITY_DESCRIPTOR security_desc = nullptr;
   PSID owner_sid = nullptr;
   PSID group_sid = nullptr;
 
+  const std::wstring folded = native_path::normalize_api_operand_w(wpath);
   const DWORD status = GetNamedSecurityInfoW(
-      const_cast<wchar_t*>(wpath.c_str()), SE_FILE_OBJECT,
+      const_cast<wchar_t*>(folded.c_str()), SE_FILE_OBJECT,
       OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION, &owner_sid,
       &group_sid, nullptr, nullptr, &security_desc);
   if (status == ERROR_SUCCESS) {
@@ -407,7 +412,10 @@ auto format_chown_error(const std::string& verb, const std::string& path,
 }
 
 auto get_owner_group_display_for_path(const std::string& path) -> std::string {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1241: fold the drive dialect before the security lookup (see
+  // get_sids_for_path).
+  std::wstring wpath =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
   PSECURITY_DESCRIPTOR security_desc = nullptr;
   PSID owner_sid = nullptr;
   PSID group_sid = nullptr;
@@ -442,7 +450,10 @@ auto get_owner_group_display_for_path(const std::string& path) -> std::string {
 }
 
 auto get_ownership_info_for_path(const std::string& path) -> OwnershipInfo {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1241: fold the drive dialect before the security lookup (see
+  // get_sids_for_path).
+  std::wstring wpath =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
   PSECURITY_DESCRIPTOR security_desc = nullptr;
   PSID owner_sid = nullptr;
   PSID group_sid = nullptr;
@@ -563,9 +574,69 @@ auto get_volume_root_path(const std::wstring& full_path) -> std::wstring {
   return buffer;
 }
 
+// True when an absolute operand lexically collapses onto the root: the
+// "."/".." reduction consumes every component ("/e/..", "/tmp/..",
+// "///e/../..").  POSIX keeps "//"-prefixed operands rooted at "//" (MSYS
+// resolves "//e/.." against the "//e" name, never "/"), so exactly two
+// leading separators followed by a component opt out.
+auto collapses_onto_root(const std::string& path) -> bool {
+  if (path.empty()) return false;
+  if (path.front() != '/' && path.front() != '\\') return false;
+  size_t leading_separators = 0;
+  while (
+      leading_separators < path.size() &&
+      (path[leading_separators] == '/' || path[leading_separators] == '\\')) {
+    ++leading_separators;
+  }
+  if (leading_separators == 2 && leading_separators < path.size()) {
+    return false;
+  }
+  std::vector<std::string_view> stack;
+  size_t i = 0;
+  while (i < path.size()) {
+    while (i < path.size() && (path[i] == '/' || path[i] == '\\')) {
+      ++i;
+    }
+    const size_t start = i;
+    while (i < path.size() && path[i] != '/' && path[i] != '\\') {
+      ++i;
+    }
+    if (start == i) continue;
+    const std::string_view component(path.data() + start, i - start);
+    if (component == ".") continue;
+    if (component == "..") {
+      if (!stack.empty()) stack.pop_back();
+      continue;
+    }
+    stack.push_back(component);
+  }
+  return stack.empty();
+}
+
 auto get_preserve_root_match(const std::string& input_path)
     -> std::optional<PreserveRootMatch> {
-  std::wstring full_path = get_full_path(utf8_to_wstring(input_path));
+  // #1241: fold the drive dialect first — "/e" names E:\, and an unfolded
+  // GetFullPathNameW resolved it against the CURRENT drive, so the
+  // --preserve-root failsafe compared "<cwd>:\e" against the volume root and
+  // missed (chgrp twin fix).
+  //
+  // All-separator spellings ("//", "///") never reach that fold: the operand
+  // layer collapses them onto "/" (then through the shell tree), while a
+  // verbatim GetFullPathNameW("//") answers for an UNC-ish name — keeping
+  // them verbatim let `chown -R --preserve-root X //` bypass the failsafe
+  // and really walk the shell root (CR on #1249).  They hit the root match
+  // directly, printing the operand spelling alone like MSYS ("on '/'",
+  // "on '//'").  A spelling that lexically collapses onto the root fires
+  // with the "(same as '/')" suffix, exactly like MSYS for "/e/..".
+  if (!input_path.empty() &&
+      input_path.find_first_not_of("/\\") == std::string::npos) {
+    return PreserveRootMatch{input_path, false};
+  }
+  if (collapses_onto_root(input_path)) {
+    return PreserveRootMatch{input_path, true};
+  }
+  const std::string folded = native_path::normalize_api_operand(input_path);
+  std::wstring full_path = get_full_path(utf8_to_wstring(folded));
   if (full_path.empty()) {
     return std::nullopt;
   }
@@ -588,7 +659,11 @@ auto add_file_args(Config& cfg, std::span<const std::string_view> args)
   for (auto arg : args) {
     std::string file_arg(arg);
     if (contains_wildcard(file_arg)) {
-      auto glob_result = glob_expand(file_arg);
+      // #1241: enumerate the folded spelling so the glob matches on the
+      // operand's drive instead of "<cwd>:\e\..."; an unmatched pattern
+      // stays literal below so diagnostics quote what the user typed.
+      auto glob_result =
+          glob_expand(native_path::normalize_api_operand(file_arg));
       if (glob_result.expanded) {
         for (const auto& file : glob_result.files) {
           cfg.files.push_back(wstring_to_utf8(file));
@@ -697,7 +772,10 @@ auto build_config(const CommandContext<CHOWN_OPTIONS.size()>& ctx)
   }
 
   if (cfg.has_reference) {
-    std::wstring wref = utf8_to_wstring(cfg.reference_file);
+    // #1241: fold the drive dialect before the reference probe; the error
+    // keeps the user's spelling (display strings ride alongside API forms).
+    std::wstring wref =
+        utf8_to_wstring(native_path::normalize_api_operand(cfg.reference_file));
     if (GetFileAttributesW(wref.c_str()) == INVALID_FILE_ATTRIBUTES) {
       return std::unexpected(
           format_missing_reference_error(cfg.reference_file, GetLastError()));
@@ -746,7 +824,13 @@ auto build_config(const CommandContext<CHOWN_OPTIONS.size()>& ctx)
 
 auto process_file(const std::string& path, const Config& cfg, bool no_deref)
     -> int {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1241: the operand may use any accepted POSIX drive spelling.  Fold once
+  // through the shared make_api_path_operand boundary before any Win32 call;
+  // an unfolded spelling made every probe and the WRITE_OWNER open answer for
+  // "<cwd>:\e\..." (chgrp/mkdir precedent).  `path` stays verbatim in every
+  // message below.
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring& wpath = operand.extended;
 
   DWORD attr = GetFileAttributesW(wpath.c_str());
   if (attr == INVALID_FILE_ATTRIBUTES) {
@@ -781,8 +865,11 @@ auto process_file(const std::string& path, const Config& cfg, bool no_deref)
     CloseHandle(probe);
   }
 
-  const auto path_sids =
-      no_deref ? get_sids_for_link(wpath) : get_sids_for_path(wpath);
+  // The security helpers re-fold their operand: hand them the native
+  // (non-extended) spelling so an already-folded form never re-enters the
+  // fold channel.
+  const auto path_sids = no_deref ? get_sids_for_link(operand.normalized)
+                                  : get_sids_for_path(operand.normalized);
 
   const bool needs_current_ownership =
       cfg.has_from_spec || cfg.verbose || cfg.changes;
@@ -944,7 +1031,10 @@ auto process_file(const std::string& path, const Config& cfg, bool no_deref)
 
 auto process_recursive(const std::string& path, const Config& cfg,
                        bool command_line_arg) -> int {
-  std::wstring wpath = utf8_to_wstring(path);
+  // #1241: fold for the enumeration/attribute APIs; children re-fold from
+  // their own display spelling (chmod -R precedent).
+  const auto operand = native_path::make_api_path_operand(path);
+  const std::wstring& wpath = operand.extended;
 
   DWORD attr = GetFileAttributesW(wpath.c_str());
   if (attr == INVALID_FILE_ATTRIBUTES) {

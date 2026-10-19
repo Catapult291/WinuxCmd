@@ -129,19 +129,16 @@ auto run(const Config& cfg) -> int {
 
   int exit_code = 0;
   for (const auto& fifo : cfg.fifos) {
-    std::filesystem::path p(fifo);
-    std::error_code ec;
-    bool exists = std::filesystem::exists(p, ec);
-    if (ec) {
-      safeErrorPrint("mkfifo: cannot create fifo '");
-      safeErrorPrint(fifo);
-      safeErrorPrint("': ");
-      safeErrorPrint(ec.message());
-      safeErrorPrint("\n");
-      exit_code = 1;
-      continue;
-    }
-    if (exists) {
+    // #1235: the operand may use any accepted POSIX drive spelling
+    // ("/e/p", "/cygdrive/e/p", "/mnt/e/p").  Handing that raw text to the
+    // existence probe / create_winux_fifo_w makes Win32 resolve a leading
+    // "/e" against the CURRENT drive, so from a C: cwd `mkfifo /e/p` probed
+    // "<cwd>:\e\p" and would have landed the marker beside the cwd.  Fold
+    // once through the shared make_api_path_operand boundary before any
+    // filesystem call; `fifo` stays verbatim in every message, like MSYS.
+    const auto operand = native_path::make_api_path_operand(fifo);
+    const DWORD existing = native_path::operand_target_attributes_w(operand);
+    if (existing != INVALID_FILE_ATTRIBUTES) {
       safeErrorPrint("mkfifo: cannot create fifo '");
       safeErrorPrint(fifo);
       safeErrorPrint("': File exists\n");
@@ -158,7 +155,7 @@ auto run(const Config& cfg) -> int {
       readonly = true;
     }
     const DWORD created =
-        native_path::create_winux_fifo_w(utf8_to_wstring(fifo), readonly);
+        native_path::create_winux_fifo_w(operand.normalized, readonly);
     if (created != ERROR_SUCCESS) {
       safeErrorPrint("mkfifo: cannot create fifo '");
       safeErrorPrint(fifo);

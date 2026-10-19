@@ -66,7 +66,11 @@ auto add_file_args(Config& cfg, std::span<const std::string_view> args)
   for (auto arg : args) {
     std::string file_arg(arg);
     if (contains_wildcard(file_arg)) {
-      auto glob_result = glob_expand(file_arg);
+      // #1241: enumerate the folded spelling so the glob matches on the
+      // operand's drive instead of "<cwd>:\e\..."; an unmatched pattern
+      // stays literal below so diagnostics quote what the user typed.
+      auto glob_result =
+          glob_expand(native_path::normalize_api_operand(file_arg));
       if (glob_result.expanded) {
         for (const auto& file : glob_result.files) {
           cfg.files.push_back(wstring_to_utf8(file));
@@ -131,7 +135,12 @@ auto build_config(const CommandContext<CHCON_OPTIONS.size()>& ctx)
   }
 
   for (const auto& file : cfg.files) {
-    std::wstring wfile = utf8_to_wstring(file);
+    // #1241: fold the drive dialect before the access probe; an unfolded
+    // GetFileAttributesW answered for "<cwd>:\e\..." and existing E: files
+    // were reported as missing whenever the cwd sat on another drive.  The
+    // error keeps the user's spelling.
+    std::wstring wfile =
+        utf8_to_wstring(native_path::normalize_api_operand(file));
     if (GetFileAttributesW(wfile.c_str()) == INVALID_FILE_ATTRIBUTES) {
       return std::unexpected(
           winux::i18n::translate("command.chcon.error.cannot_access",
