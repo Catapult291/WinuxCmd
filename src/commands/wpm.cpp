@@ -441,6 +441,59 @@ auto find_package(const nlohmann::json& index, std::string_view name)
   return std::nullopt;
 }
 
+/// A package may be an alias: an index entry that installs nothing of its own
+/// and names the package which actually provides the command. That keeps one
+/// name per tool - `git` and `niugit` both claimed `commands: ["git"]`, so an
+/// install depended on which entry a user happened to pick, and the same shape
+/// exists for `awk`/`gawk` in the index
+/// (unixwin/WinuxCmd#1218).
+constexpr size_t kMaxPackageAliasDepth = 4;
+
+auto package_alias_target(const nlohmann::json& pkg) -> std::string {
+  if (!pkg.contains("alias_of") || !pkg["alias_of"].is_string()) return {};
+  return pkg["alias_of"].get<std::string>();
+}
+
+struct ResolvedPackageAlias {
+  /// The package that installs something.
+  std::string name;
+  /// Requested name first, target last.
+  std::vector<std::string> chain;
+  bool cycle = false;
+};
+
+auto resolve_package_alias(const nlohmann::json& index,
+                           std::string_view requested) -> ResolvedPackageAlias {
+  ResolvedPackageAlias resolved{std::string(requested), {std::string(requested)},
+                                false};
+  for (size_t depth = 0; depth < kMaxPackageAliasDepth; ++depth) {
+    auto pkg = find_package(index, resolved.name);
+    if (!pkg) break;
+    const auto target = package_alias_target(*pkg);
+    if (target.empty()) break;
+    if (std::ranges::find(resolved.chain, target) != resolved.chain.end()) {
+      // Show the closing hop too, so the message reads as the loop it is:
+      // loop-a -> loop-b -> loop-a.
+      resolved.chain.push_back(target);
+      resolved.cycle = true;
+      break;
+    }
+    resolved.name = target;
+    resolved.chain.push_back(target);
+  }
+  return resolved;
+}
+
+auto format_package_alias_chain(const std::vector<std::string>& chain)
+    -> std::string {
+  std::string text;
+  for (size_t i = 0; i < chain.size(); ++i) {
+    if (i != 0) text += " -> ";
+    text += chain[i];
+  }
+  return text;
+}
+
 auto detect_arch_key() -> std::string {
   SYSTEM_INFO info{};
   GetNativeSystemInfo(&info);
@@ -2405,6 +2458,7 @@ auto artifact_install_state(const nlohmann::json& pkg) -> std::string {
 }
 
 auto package_state_label(const nlohmann::json& pkg) -> std::string {
+  if (!package_alias_target(pkg).empty()) return "alias";
   return artifact_install_state(pkg) == "ready" ? "ready" : "index-only";
 }
 
@@ -3664,6 +3718,41 @@ auto install_package(const Options& opts, std::string_view package_name,
     safeErrorPrintLn(line);
     json_errors.push_back(std::move(line));
     return finish(false, "not_found");
+  }
+
+  // Follow `alias_of` before anything looks at artifacts: an alias entry has
+  // none on purpose.
+  if (const auto resolved = resolve_package_alias(index, requested);
+      resolved.name != requested) {
+    if (resolved.cycle) {
+      auto line = wpm_text("command.wpm.error.alias_cycle",
+                           "wpm: '{}' is part of an alias cycle: {}", requested,
+                           format_package_alias_chain(resolved.chain));
+      safeErrorPrintLn(line);
+      json_errors.push_back(std::move(line));
+      return finish(false, "alias_cycle");
+    }
+    pkg = find_package(index, resolved.name);
+    if (!pkg && !refreshed) {
+      refreshed = refresh_index_once(opts, "alias target is not in the index");
+      if (refreshed) {
+        index = load_index(opts.root);
+        pkg = find_package(index, resolved.name);
+      }
+    }
+    if (!pkg) {
+      auto line = wpm_text("command.wpm.error.alias_target",
+                           "wpm: '{}' is an alias for '{}', which is not in the "
+                           "index",
+                           requested, resolved.name);
+      safeErrorPrintLn(line);
+      json_errors.push_back(std::move(line));
+      return finish(false, "alias_target_missing");
+    }
+    progress(wpm_text("command.wpm.status.package_alias",
+                      "wpm: '{}' is provided by '{}'", requested,
+                      resolved.name));
+    if (json_result != nullptr) (*json_result)["alias_of"] = resolved.name;
   }
 
   auto state = artifact_install_state(*pkg);
@@ -5491,11 +5580,15 @@ auto show_info(const Options& opts, std::string_view name) -> int {
   if (opts.json) {
     auto payload = package_info_json(opts.root, *pkg);
     payload["schema"] = 1;
+    if (const auto target = package_alias_target(*pkg); !target.empty())
+      payload["alias_of"] = target;
     safePrintLn(payload.dump(2));
     return 0;
   }
   safePrintLn("Name: " + pkg->value("name", ""));
   safePrintLn("Version: " + pkg->value("version", ""));
+  if (const auto target = package_alias_target(*pkg); !target.empty())
+    safePrintLn("Alias of: " + target);
   safePrintLn("Kind: " + pkg->value("kind", ""));
   safePrintLn("Category: " + pkg->value("category", ""));
   safePrintLn("License: " + pkg->value("license", ""));
