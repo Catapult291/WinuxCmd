@@ -568,6 +568,117 @@ TEST(date, date_file_bare_drive_root_reports_is_a_directory) {
             std::string::npos);
 }
 
+// ===== #1256 regression: POSIX drive-dialect -r/--reference operands =====
+//
+// `date -r /e/Data/file` probed the raw dialect text with
+// GetFileAttributesExW, and Win32 resolves a leading "/e" against the
+// CURRENT drive - from a foreign cwd -r reported "failed to get
+// modification time" for a file that exists on the operand's drive (MSYS
+// date reads the same spelling from anywhere).  The probes below
+// synthesize the dialect spellings from the TempDir's own drive, so the
+// assertions work on any host regardless of which drives exist.
+
+// Stamp NAME inside DIR with a fixed UTC mtime, like the plain -r
+// regression above; the exact stamp is what the -r probes assert on.
+void stamp_reference_mtime(const TempDir &dir, const wchar_t *name) {
+  Pipeline touch;
+  touch.set_cwd(dir.wpath());
+  touch.add(L"touch.exe", {L"-d", L"2024-01-02 03:04:05 UTC", name});
+  EXPECT_EQ(touch.run().exit_code, 0);
+}
+
+TEST(date, date_reference_drive_dialect_spellings_read_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("ref1256.txt", "x\n");
+  stamp_reference_mtime(dir, L"ref1256.txt");
+
+  for (const auto &operand :
+       {date_dialect_detail::slash_drive_form(dir.path / L"ref1256.txt"),
+        date_dialect_detail::cygdrive_form(dir.path / L"ref1256.txt"),
+        date_dialect_detail::mnt_form(dir.path / L"ref1256.txt")}) {
+    Pipeline p;
+    p.set_cwd(cwd.wpath());
+    date_dialect_detail::clear_shell_root_env(p);
+    p.add(L"date.exe", {L"-u", L"-r", operand, L"+%Y-%m-%dT%H:%M:%S"});
+
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("date.exe", L"-u", L"-r", operand);
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("date -r dialect stdout", r.stdout_text);
+    TEST_LOG("date -r dialect stderr", r.stderr_text);
+
+    // Before #1256 the raw dialect text stranded on the cwd drive and the
+    // attribute probe failed even though the file exists.  MSYS date reads
+    // the same spelling from any cwd.
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_EQ_TEXT(r.stdout_text, "2024-01-02T03:04:05\n");
+    EXPECT_TRUE(r.stderr_text.empty());
+  }
+}
+
+TEST(date, date_reference_drive_dialect_cwd_on_other_drive_reads_file) {
+  TempDir tmp;
+  tmp.write("ref1256.txt", "x\n");
+  stamp_reference_mtime(tmp, L"ref1256.txt");
+  const wchar_t tmp_drive = tmp.path.wstring()[0];
+  const wchar_t other = date_dialect_detail::other_fixed_drive(
+      tmp_drive >= L'A' && tmp_drive <= L'Z'
+          ? static_cast<wchar_t>(tmp_drive - L'A' + L'a')
+          : tmp_drive);
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+
+  const std::wstring operand =
+      date_dialect_detail::slash_drive_form(tmp.path / L"ref1256.txt");
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, other) + L":\\");
+  date_dialect_detail::clear_shell_root_env(p);
+  p.add(L"date.exe", {L"-u", L"-r", operand, L"+%Y-%m-%d"});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("date.exe", L"-u", L"-r", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date -r dialect stdout", r.stdout_text);
+  TEST_LOG("date -r dialect stderr", r.stderr_text);
+
+  // The audit's exact shape: cwd on one drive, operand spelled for another.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "2024-01-02\n");
+  EXPECT_TRUE(r.stderr_text.empty());
+}
+
+TEST(date, date_reference_missing_dialect_operand_quotes_as_typed) {
+  TempDir cwd;
+  const std::wstring operand =
+      date_dialect_detail::slash_drive_form(cwd.path / L"absent1256.txt");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  date_dialect_detail::clear_shell_root_env(p);
+  p.add(L"date.exe", {L"-u", L"-r", operand, L"+%Y-%m-%d"});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("date.exe", L"-u", L"-r", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date -r missing operand stderr", r.stderr_text);
+
+  // A missing reference still fails, but the message quotes the operand
+  // exactly as typed - the dialect fold happens only at the Win32 probe
+  // boundary, like MSYS which echoes the spelling the user used.
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("failed to get modification time of '"),
+            std::string::npos);
+  EXPECT_NE(r.stderr_text.find(date_dialect_detail::utf8_operand(operand)),
+            std::string::npos);
+}
+
 // [GNU] %^ forces upper case; %# swaps the natural case per specifier
 // (upper for weekday/month names, lower for meridiem and zone name),
 // matching gnulib strftime semantics (uutils #14351).
