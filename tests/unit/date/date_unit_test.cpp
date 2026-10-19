@@ -396,6 +396,178 @@ TEST(date, date_file_valid_file_prints_every_line) {
   EXPECT_EQ(r.stdout_text, "2024-01-02T03:04:05\n2025-06-07T08:09:10\n");
 }
 
+// ===== #1239 regression: POSIX drive-dialect operands =====
+//
+// `date -f /e/Data/file` used to hand the raw dialect text to
+// is_directory/std::ifstream, and Win32 resolves a leading "/e" against the
+// CURRENT drive - from a foreign cwd every POSIX spelling reported ENOENT
+// for a file that exists on the operand's drive (MSYS date reads the same
+// spelling from anywhere). The probes below synthesize the dialect
+// spellings from the TempDir's own drive, so the assertions work on any
+// host regardless of which drives exist.
+namespace date_dialect_detail {
+
+// The MSYS single-letter drive spellings of a native path
+// ("D:\repo\f.txt"): "/d/repo/f.txt", "/cygdrive/d/repo/f.txt",
+// "/mnt/d/repo/f.txt".
+auto slash_drive_form(const std::filesystem::path &native) -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+auto cygdrive_form(const std::filesystem::path &native) -> std::wstring {
+  return L"/cygdrive" + slash_drive_form(native);
+}
+
+auto mnt_form(const std::filesystem::path &native) -> std::wstring {
+  return L"/mnt" + slash_drive_form(native);
+}
+
+// First fixed drive whose letter differs from OTHER, or L'\0' when none.
+auto other_fixed_drive(wchar_t other) -> wchar_t {
+  wchar_t buf[512];
+  const DWORD len =
+      GetLogicalDriveStringsW(static_cast<DWORD>(std::size(buf)), buf);
+  for (DWORD i = 0; i + 1 < len;) {
+    const wchar_t *entry = buf + i;
+    const size_t entry_len = std::wcslen(entry);
+    if (entry_len == 0) break;
+    i += static_cast<DWORD>(entry_len) + 1;
+    if (entry_len < 3 || entry[1] != L':' || entry[2] != L'\\') continue;
+    wchar_t drive = entry[0];
+    if (drive >= L'A' && drive <= L'Z') {
+      drive = static_cast<wchar_t>(drive - L'A' + L'a');
+    }
+    if (drive == other) continue;
+    if (GetDriveTypeW(entry) != DRIVE_FIXED) continue;
+    return drive;
+  }
+  return L'\0';
+}
+
+void clear_shell_root_env(Pipeline &pipeline) {
+  for (const auto *name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+// UTF-8 form of an operand for stderr substring comparisons.
+auto utf8_operand(const std::wstring &text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+}  // namespace date_dialect_detail
+
+TEST(date, date_file_drive_dialect_spellings_read_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("dates1239.txt", "2024-01-02 03:04:05\n2025-06-07 08:09:10\n");
+
+  for (const auto &operand :
+       {date_dialect_detail::slash_drive_form(dir.path / L"dates1239.txt"),
+        date_dialect_detail::cygdrive_form(dir.path / L"dates1239.txt"),
+        date_dialect_detail::mnt_form(dir.path / L"dates1239.txt")}) {
+    Pipeline p;
+    p.set_cwd(cwd.wpath());
+    date_dialect_detail::clear_shell_root_env(p);
+    p.add(L"date.exe", {L"-u", L"-f", operand, L"+%Y-%m-%dT%H:%M:%S"});
+
+    auto r = p.run();
+
+    TEST_LOG_CMD_LIST("date.exe", L"-u", L"-f", operand);
+    TEST_LOG_EXIT_CODE(r);
+    TEST_LOG("date -f dialect stdout", r.stdout_text);
+    TEST_LOG("date -f dialect stderr", r.stderr_text);
+
+    // Before #1239 the raw dialect text stranded on the cwd drive and the
+    // open reported ENOENT even though the file exists.  MSYS date reads
+    // the same spelling from any cwd.
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_EQ_TEXT(r.stdout_text, "2024-01-02T03:04:05\n2025-06-07T08:09:10\n");
+    EXPECT_TRUE(r.stderr_text.empty());
+  }
+}
+
+TEST(date, date_file_drive_dialect_cwd_on_other_drive_reads_file) {
+  TempDir tmp;
+  tmp.write("dates1239.txt", "2024-01-02 03:04:05\n2025-06-07 08:09:10\n");
+  const wchar_t tmp_drive = tmp.path.wstring()[0];
+  const wchar_t other = date_dialect_detail::other_fixed_drive(
+      tmp_drive >= L'A' && tmp_drive <= L'Z'
+          ? static_cast<wchar_t>(tmp_drive - L'A' + L'a')
+          : tmp_drive);
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, other) + L":\\");
+  date_dialect_detail::clear_shell_root_env(p);
+  p.add(L"date.exe",
+        {L"-u", L"-f",
+         date_dialect_detail::slash_drive_form(tmp.path / L"dates1239.txt"),
+         L"+%Y-%m-%d"});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST(
+      "date.exe", L"-u", L"-f",
+      date_dialect_detail::slash_drive_form(tmp.path / L"dates1239.txt"));
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date -f dialect stdout", r.stdout_text);
+  TEST_LOG("date -f dialect stderr", r.stderr_text);
+
+  // The audit's exact shape: cwd on one drive, operand spelled for another.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "2024-01-02\n2025-06-07\n");
+}
+
+TEST(date, date_file_bare_drive_root_reports_is_a_directory) {
+  TempDir cwd;
+  const wchar_t drive = cwd.path.wstring()[0];
+  const std::wstring operand = std::wstring(L"/") + drive;
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, drive) + L":\\");
+  date_dialect_detail::clear_shell_root_env(p);
+  p.add(L"date.exe", {L"-u", L"-f", operand, L"+%Y-%m-%d"});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("date.exe", L"-u", L"-f", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("date -f drive root stderr", r.stderr_text);
+
+  // Bare "/x" names the drive root: a directory operand keeps the [GNU]
+  // "read error: Is a directory" report (same as `date -f adir`), with the
+  // operand quoted as typed.  Pre-#1239 the spelling was probed against
+  // the cwd drive and reported ENOENT instead.
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_NE(r.stderr_text.find("read error: Is a directory"),
+            std::string::npos);
+  EXPECT_NE(r.stderr_text.find(date_dialect_detail::utf8_operand(operand)),
+            std::string::npos);
+}
+
 // [GNU] %^ forces upper case; %# swaps the natural case per specifier
 // (upper for weekday/month names, lower for meridiem and zone name),
 // matching gnulib strftime semantics (uutils #14351).
