@@ -329,6 +329,33 @@ auto shell_tree_display_w(std::wstring_view native)
   return under(shell_ns::home_parent_w(), L"/home");
 }
 
+// Fold the MSYS single-letter drive dialect onto its native spelling: "/e"
+// and "/e/Data" name "E:\" and "E:\Data". Every boundary that accepts a raw
+// POSIX spelling goes through this one helper so the recognition rule stays
+// single-sourced: the first segment is exactly one drive letter ("usr",
+// "cygdrive", "mntcc" are never drives; the /cygdrive/X (#1145) and /mnt/X
+// (#1172) prefixes are folded into this same spelling by their own branches
+// before this rule is consulted). Returns nullopt for any other spelling.
+// Consumers: normalize_api_operand_w (the argv operand boundary) and
+// canonicalize_path_w (the realpath/readlink/stat -L resolver, #1231).
+auto fold_drive_dialect_w(std::wstring_view normalized)
+    -> std::optional<std::wstring> {
+  if (!shell_ns::is_drive_form(normalized)) {
+    return std::nullopt;
+  }
+  std::wstring folded;
+  wchar_t drive = normalized[1];
+  if (drive >= L'a' && drive <= L'z') {
+    drive = static_cast<wchar_t>(drive - L'a' + L'A');
+  }
+  folded.push_back(drive);
+  folded.append(L":\\");
+  if (normalized.size() > 3) {
+    folded.append(normalized.substr(3));
+  }
+  return normalize_separators(std::move(folded));
+}
+
 export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
   const bool had_trailing_separator =
       strip_trailing_separators(path).size() != path.size();
@@ -405,21 +432,8 @@ export auto normalize_api_operand_w(std::wstring_view path) -> std::wstring {
       normalized = L"/" + normalized.substr(drive_pos);
     }
   }
-  if (normalized.size() >= 2 && is_separator(normalized[0]) &&
-      ((normalized[1] >= L'a' && normalized[1] <= L'z') ||
-       (normalized[1] >= L'A' && normalized[1] <= L'Z')) &&
-      (normalized.size() == 2 || is_separator(normalized[2]))) {
-    std::wstring drive_path;
-    wchar_t drive = normalized[1];
-    if (drive >= L'a' && drive <= L'z') {
-      drive = static_cast<wchar_t>(drive - L'a' + L'A');
-    }
-    drive_path.push_back(drive);
-    drive_path.append(L":\\");
-    if (normalized.size() > 3) {
-      drive_path.append(normalized.substr(3));
-    }
-    normalized = normalize_separators(std::move(drive_path));
+  if (auto folded = fold_drive_dialect_w(normalized)) {
+    normalized = std::move(*folded);
   }
   // niubash#346: after the cygdrive/drive folds above, any remaining
   // "/"-prefixed operand is a shell-namespace spelling (the bare "/", a
@@ -1047,7 +1061,20 @@ export auto canonicalize_path_w(std::wstring_view path, CanonMode mode,
   // is its POSIX mount name, so readlink -f/realpath agree with pwd.
   std::optional<std::wstring> shell_input;
   std::wstring effective(path);
-  if (auto mapped = shell_tree_to_native_w(strip_trailing_separators(path))) {
+  // #1231: fold the MSYS drive dialect before anything consumes the operand.
+  // "/e/Data" has no root name in the std::filesystem sense, so the component
+  // walk below used to strand it on the current directory and
+  // realpath/readlink -f/stat -L resolved "<cwd-drive>:\e\Data"-style names
+  // whenever the cwd sat on another drive. Same rule, same position as the
+  // argv boundary (normalize_api_operand_w folds the drive form before the
+  // shell-tree mapping looks at the operand); shell_tree_map_w declines
+  // drive forms for the same reason. A drive-form operand is native-dialect
+  // input: it resolves to the native spelling and is not re-expressed as a
+  // shell-namespace path afterwards.
+  if (auto folded = fold_drive_dialect_w(strip_trailing_separators(path))) {
+    effective = std::move(*folded);
+  } else if (auto mapped =
+                 shell_tree_to_native_w(strip_trailing_separators(path))) {
     shell_input = *mapped;
     effective = *mapped;
   }

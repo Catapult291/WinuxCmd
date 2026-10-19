@@ -635,3 +635,119 @@ TEST(realpath, realpath_existing_file_with_trailing_separator_fails) {
   EXPECT_TRUE(r.stdout_text.empty());
   EXPECT_TRUE(r.stderr_text.find("Not a directory") != std::string::npos);
 }
+
+namespace {
+
+// #1231: the MSYS single-letter drive spelling of a native path
+// ("D:\repo\x" -> "/d/repo/x"): lowercase drive letter, forward separators.
+auto drive_dialect_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+// The dialect fold runs before the shell-tree mapping, so the expectations
+// below hold with the shell namespace unconfigured too; pin that down.
+void clear_shell_root_env(Pipeline& pipeline) {
+  for (const auto* name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+}  // namespace
+
+TEST(realpath, realpath_drive_dialect_resolves_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.mkdir("prog");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"realpath.exe", {drive_dialect_spelling(dir.path) + L"/prog"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("realpath drive dialect output", r.stdout_text);
+
+  // Before #1231 the operand had no root name in the std::filesystem sense,
+  // so the resolver walked it relative to the cwd and reported ENOENT for a
+  // directory that exists on the named drive.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text((dir.path / "prog").string() + "\n"));
+}
+
+TEST(realpath, realpath_missing_mode_keeps_drive_dialect_native_spelling) {
+  TempDir dir;
+  TempDir cwd;
+  dir.mkdir("prog");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"realpath.exe",
+        {L"-m", drive_dialect_spelling(dir.path) + L"/prog/absent.txt"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("realpath -m drive dialect output", r.stdout_text);
+
+  // -m prints the folded native spelling, never a cwd-stranded walk.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(
+      normalize_path_text(r.stdout_text),
+      normalize_path_text((dir.path / "prog" / "absent.txt").string() + "\n"));
+}
+
+TEST(realpath, realpath_bare_drive_dialect_is_drive_root) {
+  TempDir cwd;
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"realpath.exe",
+        {L"-m", drive_dialect_spelling(cwd.path).substr(0, 2)});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("realpath bare drive dialect output", r.stdout_text);
+
+  // "/x" names the root of the drive, not <cwd>\x.
+  EXPECT_EQ(r.exit_code, 0);
+  std::string expected(
+      1, static_cast<char>(
+             std::toupper(static_cast<unsigned char>(cwd.path.string()[0]))));
+  expected += ":\\\n";
+  EXPECT_EQ_TEXT(r.stdout_text, expected);
+}
+
+TEST(realpath, realpath_multi_letter_first_segment_is_not_a_drive) {
+  TempDir cwd;
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"realpath.exe", {L"-m", L"/nodrive"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("realpath multi-letter first segment output", r.stdout_text);
+
+  // The recognition rule is exactly one drive letter: "nodrive" is an
+  // ordinary POSIX word, so the operand keeps resolving relative to the cwd.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text((cwd.path / "nodrive").string() + "\n"));
+}

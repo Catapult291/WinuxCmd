@@ -326,3 +326,145 @@ TEST(stat, stat_dereference_dangling_symlink_fails) {
   EXPECT_EQ(r.exit_code, 1);
   EXPECT_TRUE(r.stderr_text.find("cannot stat") != std::string::npos);
 }
+
+namespace {
+
+// #1231: the MSYS single-letter drive spelling of a native path
+// ("D:\repo\x" -> "/d/repo/x"): lowercase drive letter, forward separators.
+auto drive_dialect_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+void clear_shell_root_env(Pipeline& pipeline) {
+  for (const auto* name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+bool create_symlink_or_skip(const std::filesystem::path& link,
+                            const std::filesystem::path& target) {
+  DWORD flags = 0;
+#ifdef SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+  flags |= SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+#endif
+
+  if (CreateSymbolicLinkW(link.wstring().c_str(), target.wstring().c_str(),
+                          flags)) {
+    return true;
+  }
+
+  std::cout << "  SKIPPED (CreateSymbolicLinkW failed with error "
+            << GetLastError() << ")\n";
+  return false;
+}
+
+}  // namespace
+
+TEST(stat, stat_drive_dialect_operand_resolves_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"stat.exe", {drive_dialect_spelling(dir.path) + L"/f.txt"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stat drive dialect output", r.stdout_text);
+
+  // Before #1231 the raw dialect text was probed with GetFullPathNameW,
+  // which stranded it on the cwd's drive and reported a bogus ENOENT.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
+}
+
+TEST(stat, stat_dereference_drive_dialect_operand_resolves) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "data");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"stat.exe", {L"-L", drive_dialect_spelling(dir.path) + L"/f.txt"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stat -L drive dialect output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
+}
+
+TEST(stat, stat_dereference_follows_drive_dialect_symlink) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "data");
+
+  std::filesystem::path link = dir.path / "link";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"f.txt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"stat.exe", {L"-L", drive_dialect_spelling(dir.path) + L"/link"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stat -L drive dialect symlink output", r.stdout_text);
+
+  // -L resolves the link through the canonicalize layer: the dialect
+  // operand must fold before the component walk, and the link's target
+  // must be reached.  [GNU] stat echoes the operand as typed in the
+  // File: line ("link", never the target name) and reports the target's
+  // metadata: the regular file's size ("data" = 4 bytes), not the reparse
+  // point's, and no lstat "-> target" display.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("link") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("Size: 4") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("regular file") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("->") == std::string::npos);
+}
+
+TEST(stat, stat_lstat_drive_dialect_symlink_reports_link) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "data");
+
+  std::filesystem::path link = dir.path / "link";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"f.txt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"stat.exe", {drive_dialect_spelling(dir.path) + L"/link"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("stat (lstat) drive dialect symlink output", r.stdout_text);
+
+  // Default stat() is lstat(): the symlink operand reports the link itself
+  // and displays its target.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stdout_text.find("link") != std::string::npos);
+  EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
+}
