@@ -97,6 +97,13 @@ repository release tags.
   newline at EOF no longer synthesizes an entry (matching util-linux look,
   which also treats a lone "\n" file as exactly one empty entry); empty
   lines in the middle of the dictionary keep working as real entries.
+- **tree**: the `-o` output operand did not fold through the shared
+  `normalize_api_operand` boundary, so `tree -o /e/probe/out.txt` from a
+  foreign cwd opened a shadow `C:\e\probe\out.txt` on the cwd's drive - or
+  failed to open at all - instead of writing on the named drive (#1254,
+  the write-side follow-up to #1236). The output operand folds once like
+  the root operand; the open-failure message keeps quoting the spelling as
+  typed.
 
 ## [1.1.14] - 2026-10-17
 
