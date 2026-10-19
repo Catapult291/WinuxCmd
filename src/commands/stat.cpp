@@ -1076,19 +1076,27 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
   // (#1061).
   std::filesystem::path p(utf8_to_wstring(filename));
 
+  // Resolve the operand through the shared path boundary like every other
+  // consumer: normalize_api_operand_w folds the POSIX drive dialect there
+  // ("/e/Data" = "E:\Data", #1231), so the probes below never see a raw
+  // spelling that GetFullPathNameW would strand on the current drive and
+  // misreport as ENOENT. Everything downstream keeps echoing the operand as
+  // the user typed it.
+  const auto operand = native_path::make_api_path_operand_w(p.wstring());
+
   // [GNU] Default stat() is lstat(): a symlink operand (even a dangling one)
   // stats the link itself; only -L follows it.
-  const bool is_link = operand_is_symlink_w(p.wstring());
+  const bool is_link = operand_is_symlink_w(operand.normalized);
   const bool lstat_link = !cfg.dereference && is_link;
 
   // [GNU] stat -L follows the link: a dangling target fails with ENOENT
   // ("cannot statx 'dang': No such file or directory") (#1060).  Windows
   // attribute queries return the reparse point's own metadata even when
   // the target is gone, so resolve the operand through canonicalize.
-  std::filesystem::path stat_target = p;
+  std::filesystem::path stat_target = std::filesystem::path(operand.normalized);
   if (cfg.dereference && is_link) {
     auto resolved = native_path::canonicalize_path_w(
-        p.wstring(), native_path::CanonMode::existing);
+        operand.normalized, native_path::CanonMode::existing);
     if (!resolved) {
       // [GNU] modern GNU stat uses the statx verb (uutils #13012)
       safeErrorPrint("stat: cannot statx '");
@@ -1145,11 +1153,13 @@ auto print_stat(const std::string& filename, const Config& cfg) -> int {
   const auto& stat = *stat_result;
 
   // [GNU] A non-dereferenced symlink operand displays as "'name' ->
-  // 'target'" in the File: line (uutils #8789).
+  // 'target'" in the File: line (uutils #8789).  The link is read through
+  // the resolved target, not the raw spelling, so dialect operands resolve
+  // too (#1231).
   std::string link_target;
   if (lstat_link) {
     std::error_code ec;
-    const auto target = std::filesystem::read_symlink(p, ec);
+    const auto target = std::filesystem::read_symlink(stat_target, ec);
     if (!ec) {
       link_target = wstring_to_utf8(target.wstring());
     }

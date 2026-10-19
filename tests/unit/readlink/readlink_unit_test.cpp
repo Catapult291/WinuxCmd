@@ -448,3 +448,76 @@ TEST(readlink, readlink_f_resolves_intermediate_symlink) {
   EXPECT_TRUE(r.stdout_text.find("f.txt") != std::string::npos);
   EXPECT_TRUE(r.stdout_text.find("ldir") == std::string::npos);
 }
+
+namespace {
+
+// #1231: the MSYS single-letter drive spelling of a native path
+// ("D:\repo\x" -> "/d/repo/x"): lowercase drive letter, forward separators.
+auto drive_dialect_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+void clear_shell_root_env(Pipeline& pipeline) {
+  for (const auto* name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+}  // namespace
+
+TEST(readlink, readlink_f_drive_dialect_resolves_from_foreign_cwd) {
+  TempDir dir;
+  TempDir cwd;
+  dir.write("f.txt", "content");
+
+  std::filesystem::path link = dir.path / "link";
+  if (!create_symlink_or_skip(link, std::filesystem::path(L"f.txt"))) {
+    return;
+  }
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"readlink.exe", {L"-f", drive_dialect_spelling(dir.path) + L"/link"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("readlink -f drive dialect output", r.stdout_text);
+
+  // Before #1231 "/<drive>/..." had no root name, so -f walked the operand
+  // relative to the cwd and failed ENOENT instead of resolving the link.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text((dir.path / "f.txt").string() + "\n"));
+}
+
+TEST(readlink, readlink_f_drive_dialect_directory_operand) {
+  TempDir dir;
+  TempDir cwd;
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"readlink.exe", {L"-f", drive_dialect_spelling(dir.path)});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("readlink -f drive dialect dir output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(normalize_path_text(r.stdout_text),
+                 normalize_path_text(dir.path.string() + "\n"));
+}
