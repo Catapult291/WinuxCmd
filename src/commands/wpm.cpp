@@ -3193,6 +3193,31 @@ auto package_command_count(const nlohmann::json& pkg) -> int {
 // Shim commands are hardlinks of winuxcmd.exe itself (same model as builtin
 // command links): the dispatcher forwards non-builtin names to
 // opt\<pkg>\<cmd>.exe, keeping single-binary distribution intact.
+/// Where a shim-layout command's payload lands. The convention is
+/// `opt\<pkg>\<command>.exe`, but a payload that must keep its own directory
+/// layout (codex ships `bin/codex.exe` beside `codex-resources/`) declares the
+/// destination in its `files` mapping instead - and the entry link for flat
+/// layouts has always been resolved that way. Look in both places, in that
+/// order, so a package never ends up with a shim that cannot find its payload.
+auto shim_payload_for(const fs::path& root, const std::string& package,
+                      const std::string& command, const nlohmann::json& artifact)
+    -> fs::path {
+  std::error_code ec;
+  const fs::path conventional =
+      package_payload_dir(root, package) / exe_suffix(command);
+  if (fs::is_regular_file(conventional, ec)) return conventional;
+  if (artifact.contains("files") && artifact["files"].is_array()) {
+    for (const auto& mapping : artifact["files"]) {
+      if (mapping_is_directory(mapping)) continue;
+      auto destination =
+          artifact_destination_for_mapping(root, artifact, package, mapping);
+      if (!destination) continue;
+      if (destination->filename() == exe_suffix(command)) return *destination;
+    }
+  }
+  return conventional;
+}
+
 auto create_package_shims(const fs::path& root, const nlohmann::json& pkg,
                           bool force, bool dry_run, bool json) -> bool {
   const std::string package = pkg.value("name", "");
@@ -3258,8 +3283,12 @@ auto create_package_shims(const fs::path& root, const nlohmann::json& pkg,
     }
     if (!forwarder.empty()) {
       // Point the forwarder at this package's payload for this command.
-      const fs::path payload =
-          package_payload_dir(root, package) / exe_suffix(command);
+      const auto artifact_for_shim = artifact_for_current_arch(pkg);
+      const fs::path payload = artifact_for_shim
+                                   ? shim_payload_for(root, package, command,
+                                                      *artifact_for_shim)
+                                   : package_payload_dir(root, package) /
+                                         exe_suffix(command);
       if (fs::is_regular_file(payload, ec)) {
         const fs::path relative = fs::relative(payload, root, ec);
         if (!ec && set_shim_map_entry(root, command, relative.string()) == false) {

@@ -2285,6 +2285,60 @@ std::string alias_fixture_index_json(const std::filesystem::path& artifact_path)
 
 }  // namespace
 
+TEST(wpm, wpm_shim_map_points_at_a_non_conventional_payload) {
+  // A payload that must keep its own directory layout (codex ships
+  // bin/codex.exe beside codex-resources/) declares its destination in `files`;
+  // the shim map has to follow that, not the opt/<pkg>/<cmd>.exe convention.
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"tool.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/tool.exe", "external exe\n");
+  tmp.write("fixture-nested-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-nested-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"nested shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" + file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"bin/tool.exe\"}]}}}\n"
+                "  ]\n"
+                "}\n");
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-nested-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+
+  const auto map = tmp.read(".wpm/shims.map");
+  EXPECT_CONTAINS(map, "tool=opt");
+  EXPECT_CONTAINS(map, "bin");
+  EXPECT_TRUE(std::filesystem::exists(tmp.path / L"opt" / L"tool" / L"bin" /
+                                      L"tool.exe"));
+}
+
 TEST(wpm, wpm_install_follows_a_package_alias) {
   TempDir tmp;
   const auto artifact_path = tmp.path / L"source" / L"tool.exe";
