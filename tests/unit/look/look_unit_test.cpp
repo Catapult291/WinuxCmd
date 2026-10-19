@@ -215,3 +215,126 @@ TEST(look, look_native_dictionary_still_opens) {
   EXPECT_EQ(r.exit_code, 0);
   EXPECT_EQ_TEXT(r.stdout_text, "bravo\n");
 }
+
+// ===== #1251 regression: a final newline must not synthesize an entry =====
+//
+// The read loop emitted an empty line for the text after the last '\n', so a
+// standard trailing-newline dictionary carried a phantom "" entry at the END
+// of the sorted array. "" sorts before every key, but the binary search's
+// midpoint can land on the phantom and push lower_bound past the last real
+// word: `look -f delt` printed nothing for "…charlie\ndelta\n". Oracle:
+// util-linux look 2.39.3 (WSL) prints "delta" for the same input — a final
+// newline contributes no entry, while empty lines in the MIDDLE of the
+// dictionary stay real entries (matched by an empty key).
+
+TEST(look, look_trailing_newline_dictionary_finds_last_entry) {
+  TempDir tmp;
+  look_dialect_detail::write_sorted_dictionary(tmp);
+  const std::wstring operand = tmp.wpath() + L"\\wbdict.txt";
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  look_dialect_detail::clear_shell_root_env(p);
+  p.add(L"look.exe", {L"-f", L"delt", operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("look.exe", L"-f", L"delt", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("look trailing newline stdout", r.stdout_text);
+
+  // Before #1251 the phantom empty line made lower_bound skip past "delta".
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "delta\n");
+}
+
+TEST(look, look_trailing_newline_and_no_trailing_newline_agree) {
+  TempDir tmp;
+  tmp.write("with.txt", "alpha\nbravo\ncharlie\ndelta\n");
+  tmp.write("without.txt", "alpha\nbravo\ncharlie\ndelta");
+  const std::wstring with_nl = tmp.wpath() + L"\\with.txt";
+  const std::wstring no_nl = tmp.wpath() + L"\\without.txt";
+
+  for (const auto &[key, expected] : {std::pair{L"alp", std::string("alpha\n")},
+                                      {L"cha", std::string("charlie\n")},
+                                      {L"delt", std::string("delta\n")}}) {
+    Pipeline a;
+    a.set_cwd(tmp.wpath());
+    look_dialect_detail::clear_shell_root_env(a);
+    a.add(L"look.exe", {L"-f", key, with_nl});
+    auto ra = a.run();
+
+    TEST_LOG_CMD_LIST("look.exe", L"-f", key, with_nl);
+    TEST_LOG_EXIT_CODE(ra);
+    TEST_LOG("look with trailing newline stdout", ra.stdout_text);
+    EXPECT_EQ(ra.exit_code, 0);
+    EXPECT_EQ_TEXT(ra.stdout_text, expected);
+
+    Pipeline b;
+    b.set_cwd(tmp.wpath());
+    look_dialect_detail::clear_shell_root_env(b);
+    b.add(L"look.exe", {L"-f", key, no_nl});
+    auto rb = b.run();
+
+    TEST_LOG_CMD_LIST("look.exe", L"-f", key, no_nl);
+    TEST_LOG_EXIT_CODE(rb);
+    TEST_LOG("look without trailing newline stdout", rb.stdout_text);
+    EXPECT_EQ(rb.exit_code, 0);
+    EXPECT_EQ_TEXT(rb.stdout_text, expected);
+  }
+}
+
+TEST(look, look_middle_empty_line_dictionary_keeps_entries) {
+  TempDir tmp;
+  tmp.write("mid.txt", "alpha\n\ncharlie\ndelta\n");
+  const std::wstring operand = tmp.wpath() + L"\\mid.txt";
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  look_dialect_detail::clear_shell_root_env(p);
+  p.add(L"look.exe", {L"-f", L"del", operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("look.exe", L"-f", L"del", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("look middle empty line stdout", r.stdout_text);
+
+  // [GNU util-linux look 2.39.3] a non-empty key finds "delta" through the
+  // middle empty line; the existing semantics keep the line as a real entry.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "delta\n");
+
+  // [GNU util-linux look 2.39.3] `look ''` prefix-matches every line,
+  // including the middle empty one.
+  Pipeline empty_key;
+  empty_key.set_cwd(tmp.wpath());
+  look_dialect_detail::clear_shell_root_env(empty_key);
+  empty_key.add(L"look.exe", {L"", operand});
+  auto re = empty_key.run();
+
+  TEST_LOG_CMD_LIST("look.exe", L"", operand);
+  TEST_LOG_EXIT_CODE(re);
+  TEST_LOG("look empty key over middle empty line stdout", re.stdout_text);
+  EXPECT_EQ(re.exit_code, 0);
+  EXPECT_EQ_TEXT(re.stdout_text, "alpha\n\ncharlie\ndelta\n");
+}
+
+TEST(look, look_lone_newline_file_is_single_empty_entry) {
+  TempDir tmp;
+  tmp.write("nl.txt", "\n");
+  const std::wstring operand = tmp.wpath() + L"\\nl.txt";
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  look_dialect_detail::clear_shell_root_env(p);
+  p.add(L"look.exe", {L"", operand});
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("look.exe", L"", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("look lone newline stdout", r.stdout_text);
+
+  // [GNU util-linux look 2.39.3] a file holding one "\n" has exactly one
+  // (empty) entry; the phantom used to duplicate it.
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "\n");
+}

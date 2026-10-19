@@ -89,6 +89,14 @@ repository release tags.
   #1245, which also made shell-namespace spellings (`stat /usr/bin` under a
   configured shell root) resolve like ls and readlink -f instead of
   reporting ENOENT.
+- **look**: a dictionary ending in a final newline carried a phantom empty
+  entry at the END of the sorted line array, and the binary search's
+  midpoint could land on it - an empty string sorts before every key - so
+  lower_bound jumped past the last real word and `look -f delt` printed
+  nothing for a dictionary ending "…charlie\ndelta\n" (#1251). The final
+  newline at EOF no longer synthesizes an entry (matching util-linux look,
+  which also treats a lone "\n" file as exactly one empty entry); empty
+  lines in the middle of the dictionary keep working as real entries.
 
 ## [1.1.14] - 2026-10-17
 
