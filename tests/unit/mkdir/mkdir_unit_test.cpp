@@ -175,3 +175,218 @@ TEST(mkdir, mkdir_missing_operand_reports_help_hint) {
                  "mkdir: missing operand\n"
                  "Try 'mkdir --help' for more information.\n");
 }
+
+// ===== #1233 regression: POSIX drive-dialect operands =====
+//
+// `mkdir -p /e/Data` from a C: cwd used to hand the raw "/e/..." text to
+// CreateDirectoryW. Win32 resolves a leading "/e" against the CURRENT drive,
+// so the command really created a shadow "C:\e" tree - the only audited
+// misparse that writes to the wrong place. Every operand must fold through
+// the shared normalize_api_operand boundary before a write lands. The probes
+// below synthesize the dialect spelling from the TempDir's own drive, so the
+// assertions work on any host regardless of which drives exist.
+namespace mkdir_dialect_detail {
+
+// Lowercase drive letter of an absolute path ("C:\x" -> L'c').
+auto drive_letter(const std::filesystem::path &path) -> wchar_t {
+  wchar_t drive = path.wstring()[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  return drive;
+}
+
+// "C:\Users\...\wct123" -> "/c/Users/.../wct123" (MSYS drive spelling: the
+// colon is dropped, only the letter stays).
+auto slash_drive_form(const std::filesystem::path &path) -> std::wstring {
+  std::wstring text = path.wstring();
+  text[0] = drive_letter(path);
+  text.erase(1, 1);  // drop the ':' from "c:\..."
+  for (wchar_t &ch : text) {
+    if (ch == L'\\') ch = L'/';
+  }
+  return L"/" + text;
+}
+
+// First fixed drive whose letter differs from OTHER, or L'\0' when none.
+auto other_fixed_drive(wchar_t other) -> wchar_t {
+  wchar_t buf[512];
+  const DWORD len =
+      GetLogicalDriveStringsW(static_cast<DWORD>(std::size(buf)), buf);
+  for (DWORD i = 0; i + 1 < len;) {
+    const wchar_t *entry = buf + i;
+    const size_t entry_len = std::wcslen(entry);
+    if (entry_len == 0) break;
+    i += static_cast<DWORD>(entry_len) + 1;
+    if (entry_len < 3 || entry[1] != L':' || entry[2] != L'\\') continue;
+    wchar_t drive = entry[0];
+    if (drive >= L'A' && drive <= L'Z') {
+      drive = static_cast<wchar_t>(drive - L'A' + L'a');
+    }
+    if (drive == other) continue;
+    if (GetDriveTypeW(entry) != DRIVE_FIXED) continue;
+    return drive;
+  }
+  return L'\0';
+}
+
+// Where the BUGGY code put the probe leaf instead: it rooted the operand's
+// first component ("<drive>") on the cwd's drive, so from cwd "X:" the probe
+// appeared at "X:\<operand-drive>\<tmp-rest>". The leaf name is unique per
+// TempDir, so the negative assertion never blames pre-existing machine state.
+auto shadow_leaf(const TempDir &tmp, wchar_t cwd_drive) -> std::wstring {
+  const wchar_t operand_drive = drive_letter(tmp.path);
+  std::wstring leaf(1, cwd_drive);
+  leaf += L":\\";
+  leaf += operand_drive;
+  leaf += L"\\";
+  leaf += tmp.path.wstring().substr(3);  // past "X:\"
+  return leaf;
+}
+
+// UTF-8 form of the operand for exact stdout comparisons.
+auto utf8(const std::wstring &text) -> std::string {
+  if (text.empty()) return {};
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+                                       static_cast<int>(text.size()), nullptr,
+                                       0, nullptr, nullptr);
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                      out.data(), size, nullptr, nullptr);
+  return out;
+}
+
+}  // namespace mkdir_dialect_detail
+
+TEST(mkdir, mkdir_p_drive_dialect_operand_lands_on_operand_drive) {
+  TempDir tmp;
+  const wchar_t tmp_drive = mkdir_dialect_detail::drive_letter(tmp.path);
+  const std::wstring operand = mkdir_dialect_detail::slash_drive_form(
+      tmp.path / L"d1233" / L"probe1233");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mkdir.exe", {L"-p", operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("mkdir.exe", L"-p", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("mkdir stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.empty());
+  // Landing: under the TempDir, on the operand's drive.
+  EXPECT_TRUE(
+      std::filesystem::is_directory(tmp.path / L"d1233" / L"probe1233"));
+  // Shadow negative (#1233): the unfolded operand rooted the leaf on the cwd
+  // drive ("<cwd>:\d1233\...") - that leaf must never exist.
+  EXPECT_FALSE(std::filesystem::exists(
+      std::filesystem::path(mkdir_dialect_detail::shadow_leaf(tmp, tmp_drive))));
+}
+
+TEST(mkdir, mkdir_drive_dialect_operand_without_parents_lands_on_operand_drive) {
+  TempDir tmp;
+  const wchar_t tmp_drive = mkdir_dialect_detail::drive_letter(tmp.path);
+  const std::wstring operand =
+      mkdir_dialect_detail::slash_drive_form(tmp.path / L"probe1233");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mkdir.exe", {operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("mkdir.exe", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("mkdir stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_TRUE(std::filesystem::is_directory(tmp.path / L"probe1233"));
+  EXPECT_FALSE(std::filesystem::exists(
+      std::filesystem::path(mkdir_dialect_detail::shadow_leaf(tmp, tmp_drive))));
+}
+
+TEST(mkdir, mkdir_p_drive_dialect_cwd_on_other_drive_lands_on_operand_drive) {
+  TempDir tmp;
+  const wchar_t other = mkdir_dialect_detail::other_fixed_drive(
+      mkdir_dialect_detail::drive_letter(tmp.path));
+  if (other == L'\0') {
+    std::cout << "  SKIPPED (no second fixed drive to host the cwd)\n";
+    return;
+  }
+  const std::wstring operand =
+      mkdir_dialect_detail::slash_drive_form(tmp.path / L"probe1233");
+
+  Pipeline p;
+  p.set_cwd(std::wstring(1, other) + L":\\");
+  p.add(L"mkdir.exe", {L"-p", operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("mkdir.exe", L"-p", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("mkdir stderr", r.stderr_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_TRUE(std::filesystem::is_directory(tmp.path / L"probe1233"));
+  // The audit's exact shadow shape: cwd on one drive, operand on another -
+  // the unfolded spelling created "<cwd>:\e\Data\..." on the cwd drive.
+  EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(
+      mkdir_dialect_detail::shadow_leaf(tmp, other))));
+}
+
+TEST(mkdir, mkdir_p_bare_drive_root_operand_existing_is_success_noop) {
+  TempDir tmp;
+  const wchar_t drive = mkdir_dialect_detail::drive_letter(tmp.path);
+  const std::wstring operand = std::wstring(L"/") + drive;
+  // What the buggy code did here: -p creation of "<drive>:\<drive>" - a real
+  // folder at the drive root. Only assert when it does not pre-exist.
+  const std::wstring shadow_root = std::wstring(1, drive) + L":\\" + drive;
+  const bool shadow_pre_existed =
+      std::filesystem::exists(std::filesystem::path(shadow_root));
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mkdir.exe", {L"-p", operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("mkdir.exe", L"-p", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("mkdir stdout", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_TRUE(r.stdout_text.empty());  // [GNU] -p on an existing root: silent
+  if (!shadow_pre_existed) {
+    EXPECT_FALSE(std::filesystem::exists(std::filesystem::path(shadow_root)));
+  }
+}
+
+TEST(mkdir, mkdir_p_drive_dialect_verbose_reports_operand_form) {
+  TempDir tmp;
+  const std::wstring operand =
+      mkdir_dialect_detail::slash_drive_form(tmp.path / L"vdeep1233");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"mkdir.exe", {L"-v", L"-p", operand});
+
+  auto r = p.run();
+
+  TEST_LOG_CMD_LIST("mkdir.exe", L"-v", L"-p", operand);
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("mkdir stdout", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  // MSYS parity: only the created leaf is reported, in the operand spelling
+  // (the drive root and the TempDir chain already exist).
+  EXPECT_EQ_TEXT(r.stdout_text,
+                 "mkdir: created directory '" +
+                     mkdir_dialect_detail::utf8(operand) + "'\n");
+  EXPECT_TRUE(r.stderr_text.empty());
+  EXPECT_TRUE(std::filesystem::is_directory(tmp.path / L"vdeep1233"));
+}
