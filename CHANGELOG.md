@@ -4,10 +4,22 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
-## [Unreleased]
+## [1.1.18] - 2026-10-20
 
 ### Fixed
 
+- **winuxcmd-shim**: `winuxcmd-shim.exe` previously gated child creation
+  flags on `GetConsoleMode(GetStdHandle(...))` and passed
+  `DETACHED_PROCESS` whenever stdio was redirected (`python - <<'EOF'`,
+  pipes, agent runs). That stripped the inherited console
+  (`GetConsoleCP() == 0` in the payload), causing every console-subsystem
+  grandchild (`python` -> `git.exe`, `node` -> child tools) to allocate a
+  fresh `conhost.exe` and flash a visible console window on the desktop
+  (unixwin/niubash#466). The shim now releases only a sole-owned *visible*
+  auto-allocated console (`IsWindowVisible` + `GetConsoleProcessList == 1`)
+  when stdio is non-console, keeps any inherited or hidden console
+  (`GetConsoleCP() != 0` -> `flags = 0`), and uses `CREATE_NO_WINDOW`
+  (never `DETACHED_PROCESS`) when `GetConsoleCP() == 0`.
 - **mkfifo / mknod**: FIFO/device-node path operands resolved against the
   cwd drive (#1235, #1230 sweep). The raw `/e/p` spelling reached the
   existence probe and `create_winux_fifo_w`, and Win32 roots a leading `/e`
