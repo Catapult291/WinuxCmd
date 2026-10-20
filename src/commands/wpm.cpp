@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 caomengxuan666 <caomengxuan666@users.noreply.github.com>
 /// @Description: Winux Package Manager internal command.
 /// @Version: 0.2.0
@@ -69,8 +69,8 @@ constexpr std::string_view kBuiltinIndex = R"json(
 {
   "schema": 1,
   "name": "official",
-  "version": "builtin-2026.10.19",
-  "updated": "2026-10-19",
+  "version": "builtin-2026.10.20",
+  "updated": "2026-10-20",
   "sources": [
     {
       "name": "official-github-raw",

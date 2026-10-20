@@ -21,6 +21,8 @@
 
 #include <windows.h>
 
+#pragma comment(lib, "user32.lib")
+
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -133,24 +135,47 @@ std::wstring_view arguments_after_program(std::wstring_view command_line) {
   return command_line.substr(index);
 }
 
-/// A child that has no console of its own should not be given a hidden one:
-/// allocating it starts conhost.exe, which costs more than the forward costs.
-/// With all three streams redirected the child has no console to inherit and
-/// needs none, so it is detached; an interactive session keeps the real one.
-DWORD child_creation_flags() {
+bool any_std_stream_is_console() {
   const DWORD std_streams[] = {STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE};
   for (const DWORD stream : std_streams) {
     const HANDLE handle = GetStdHandle(stream);
     if (handle == nullptr || handle == INVALID_HANDLE_VALUE) continue;
     DWORD mode = 0;
-    if (GetConsoleMode(handle, &mode)) return 0;  // a real console: inherit it
+    if (GetConsoleMode(handle, &mode)) return true;
   }
-  return DETACHED_PROCESS;
+  return false;
+}
+
+/// Free a visible console that Windows auto-allocated for this process alone
+/// when all stdio streams are redirected. An inherited terminal, a ConPTY
+/// pseudoconsole (invisible window), or a hidden CREATE_NO_WINDOW console is
+/// kept alive so the payload and its grandchildren (`python` -> `git`) inherit
+/// it for free without flashing visible console windows.
+void release_orphan_console() {
+  if (any_std_stream_is_console()) return;
+  if (GetConsoleCP() == 0) return;
+  const HWND window = GetConsoleWindow();
+  if (window == nullptr || IsWindowVisible(window) == 0) return;
+  DWORD pids[64]{};
+  if (GetConsoleProcessList(pids, 64) != 1) return;
+  FreeConsole();
+}
+
+/// When this shim already has a console attached (inherited terminal, ConPTY,
+/// or a hidden console from `niu.exe`), pass 0 so the payload inherits it even
+/// when stdio is piped. Only when the shim itself is console-less
+/// (`GetConsoleCP() == 0`) do we allocate ONE hidden console via
+/// `CREATE_NO_WINDOW` — never `DETACHED_PROCESS`, which leaves the payload
+/// console-less and makes every console-subsystem grandchild (`git.exe`, etc.)
+/// pop up a visible console window (niubash#451/#462).
+DWORD child_creation_flags() {
+  return GetConsoleCP() == 0 ? CREATE_NO_WINDOW : 0;
 }
 
 }  // namespace
 
 int wmain(int /*argc*/, wchar_t** /*argv*/) {
+  release_orphan_console();
   const std::wstring self = executable_path();
   const std::wstring_view name = file_name_of(self);
   std::wstring command(name.substr(0, name.size() > 4 ? name.size() - 4 : name.size()));
