@@ -19,6 +19,26 @@ repository release tags.
   quote the operand verbatim, so `///` prints as `///` where MSYS shows
   `/` after its own argv-layer collapse (same refusal, display-only
   divergence).
+- **opt/ payload argv adapter (gawk CRLF)**: `usr\bin\<cmd>` shims and the
+  `winuxcmd <cmd>`/`<cmd>.exe` forwarding path now splice a fixed argv
+  prefix ahead of the forwarded arguments for commands that need one. The
+  only current entry is `awk`/`gawk` -> `-v BINMODE=3`: the bundled
+  ezwinports gawk is a text-mode mingw build whose CRT rewrote every `\n`
+  as `\r\n` on write and folded `\r\n` into `\n` on read, while every
+  winuxcmd applet does binary stdio (unixwin/niubash#467). That build
+  carries gawk's BINMODE feature but ignores the `BINMODE` environment
+  variable, so the command-line switch is the only lever; splicing it
+  first keeps a user's own `-v BINMODE=...` authoritative (later
+  assignments win). The `bin\<cmd>` PATH-entry link for adapted commands
+  now hardlinks a forwarder (`winuxcmd-shim.exe`, or `winuxcmd.exe` on an
+  installation that predates it) instead of the payload itself, and both
+  forwarders probe the installation root at the `bin\` depth as well as
+  the canonical `usr\bin\` one.
+- **`winuxcmd <verb>` forwarding**: `winuxcmd <name> args` forwarded the
+  verb itself as the payload's first argument, so `winuxcmd gawk '{print}'`
+  failed with "cannot open file '{print $1}'" and every `layout: shim`
+  payload reached through the verb form saw a corrupted argv. The verb
+  token is now skipped when the forwarded command line is rebuilt.
 
 ## [1.1.18] - 2026-10-20
 

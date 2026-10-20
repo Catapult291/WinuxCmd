@@ -172,6 +172,33 @@ DWORD child_creation_flags() {
   return GetConsoleCP() == 0 ? CREATE_NO_WINDOW : 0;
 }
 
+// unixwin/niubash#467: payloads that need a fixed argv prefix to match the
+// rest of the command layer. ezwinports gawk is a text-mode mingw build: its
+// CRT turns every \n into \r\n on write and folds \r\n into \n on read, while
+// every winuxcmd applet does binary stdio. That build does carry gawk's
+// BINMODE feature (it ignores the BINMODE *environment* variable but honors
+// `-v BINMODE=3`), so the switch moves stdin/stdout/stderr - and files the
+// program opens for writing - to binary and the bytes match GNU awk. The
+// prefix is spliced ahead of the caller's arguments so an explicit
+// `-v BINMODE=...` still wins: later command-line assignments override
+// earlier ones.
+struct ArgvAdapter {
+  std::wstring_view command;
+  std::wstring_view prefix;
+};
+constexpr ArgvAdapter kArgvAdapters[] = {
+    {L"awk", L" -v BINMODE=3"},
+    {L"gawk", L" -v BINMODE=3"},
+};
+
+std::wstring_view argv_adapter_for(std::wstring_view command) {
+  const std::wstring lowered = lower(command);
+  for (const auto& adapter : kArgvAdapters) {
+    if (lowered == adapter.command) return adapter.prefix;
+  }
+  return {};
+}
+
 }  // namespace
 
 int wmain(int /*argc*/, wchar_t** /*argv*/) {
@@ -180,7 +207,23 @@ int wmain(int /*argc*/, wchar_t** /*argv*/) {
   const std::wstring_view name = file_name_of(self);
   std::wstring command(name.substr(0, name.size() > 4 ? name.size() - 4 : name.size()));
   const std::wstring_view bin_dir = parent_of(self);
-  const std::wstring_view root = parent_of(parent_of(bin_dir));
+  // The canonical placement is <root>\usr\bin\<cmd>.exe, two directories below
+  // the installation root. Commands forwarded through an argv adapter get
+  // their PATH-entry link (<root>\bin\<cmd>.exe) pointed at this shim as well,
+  // which sits one level closer to the root - so probe the canonical depth
+  // first, then the shallower one, for the map itself. A missing map at both
+  // depths keeps the old "no payload registered" outcome below.
+  const std::wstring_view candidates[] = {parent_of(parent_of(bin_dir)),
+                                          parent_of(bin_dir)};
+  std::wstring_view root = candidates[0];
+  for (const std::wstring_view candidate : candidates) {
+    if (candidate.empty()) continue;
+    const std::wstring map = std::wstring(candidate) + L"\\" + kShimMap;
+    if (GetFileAttributesW(map.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      root = candidate;
+      break;
+    }
+  }
   if (root.empty()) {
     fwprintf(stderr, L"winuxcmd-shim: cannot locate the installation root from '%ls'\n",
              self.c_str());
@@ -204,6 +247,7 @@ int wmain(int /*argc*/, wchar_t** /*argv*/) {
   }
 
   std::wstring command_line = L"\"" + payload + L"\"" +
+                              std::wstring(argv_adapter_for(command)) +
                               std::wstring(arguments_after_program(GetCommandLineW()));
 
   // Hand the child *our* standard handles explicitly. A detached child does not

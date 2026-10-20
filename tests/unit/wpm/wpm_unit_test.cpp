@@ -2010,6 +2010,81 @@ TEST(wpm, wpm_shim_packages_use_the_forwarder_when_present) {
   EXPECT_CONTAINS(tmp.read(".wpm/shims.map"), "tool.exe");
 }
 
+// The PATH-entry link (<root>\bin\<cmd>.exe) normally hardlinks the payload
+// itself - that saves a forwarding process per call. Commands the forwarders
+// answer with an argv adapter (gawk's `-v BINMODE=3`, unixwin/niubash#467)
+// must route the entry link through a forwarder instead, or `bin\gawk.exe`
+// would reach the payload with its text-mode stdio unadapted.
+TEST(wpm, wpm_adapted_command_entry_link_targets_the_forwarder) {
+  TempDir tmp;
+  const auto artifact_path = tmp.path / L"source" / L"gawk.exe";
+  const auto root_exe = canonical_exe(tmp.path, L"winuxcmd.exe");
+  std::filesystem::create_directories(root_exe.parent_path());
+  std::filesystem::copy_file(build_winuxcmd_path(), root_exe,
+                             std::filesystem::copy_options::overwrite_existing);
+  tmp.write("source/gawk.exe", "external exe\n");
+  tmp.write("fixture-shim-index.json",
+            "{\n"
+            "  \"schema\": 1,\n"
+            "  \"name\": \"fixture\",\n"
+            "  \"version\": \"fixture-shim\",\n"
+            "  \"packages\": [\n"
+            "    {\"name\":\"gawk\",\"version\":\"1.0.0\","
+            "\"description\":\"shim fixture\",\"kind\":\"external\","
+            "\"commands\":[\"gawk\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" +
+                file_url(artifact_path) +
+                "\"],\"files\":[{\"from\":\"gawk.exe\","
+                "\"to\":\"gawk.exe\"}]}}},\n"
+            "    {\"name\":\"tool\",\"version\":\"1.0.0\","
+            "\"description\":\"control fixture\",\"kind\":\"external\","
+            "\"commands\":[\"tool\"],\"artifacts\":{\"" +
+                current_arch_key() +
+                "\":{\"type\":\"exe\","
+                "\"sha256\":\"5140f4f6bf8b5691b7bccc1c4f00a2027dae00b2110d38"
+                "a1e090af291226f322\",\"layout\":\"shim\","
+                "\"urls\":[\"" +
+                file_url(tmp.path / L"source" / L"tool.exe") +
+                "\"],\"files\":[{\"from\":\"tool.exe\","
+                "\"to\":\"tool.exe\"}]}}}\n"
+            "  ]\n"
+            "}\n");
+  tmp.write("source/tool.exe", "external exe\n");
+
+  Pipeline add;
+  add.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"add", L"fixture",
+           widen_ascii(file_url(tmp.path / L"fixture-shim-index.json")),
+           L"--root", tmp.wpath()});
+  EXPECT_EQ(add.run().exit_code, 0);
+  Pipeline use;
+  use.add(L"winuxcmd.exe",
+          {L"wpm", L"source", L"use", L"fixture", L"--root", tmp.wpath()});
+  EXPECT_EQ(use.run().exit_code, 0);
+
+  const auto forwarder = tmp.path / L"usr" / L"bin" / L"winuxcmd-shim.exe";
+  tmp.write("usr/bin/winuxcmd-shim.exe", "forwarder stub\n");
+  Pipeline install;
+  install.add(L"winuxcmd.exe",
+              {L"wpm", L"install", L"gawk", L"--root", tmp.wpath()});
+  EXPECT_EQ(install.run().exit_code, 0);
+  Pipeline install_tool;
+  install_tool.add(L"winuxcmd.exe",
+                   {L"wpm", L"install", L"tool", L"--root", tmp.wpath()});
+  EXPECT_EQ(install_tool.run().exit_code, 0);
+
+  // Adapted command: the PATH entry routes through the forwarder.
+  EXPECT_TRUE(
+      same_file(forwarder, tmp.path / L"bin" / L"gawk.exe"));
+  // Unadapted command: the PATH entry stays a free link to the payload.
+  EXPECT_TRUE(same_file(tmp.path / L"opt" / L"tool" / L"tool.exe",
+                        tmp.path / L"bin" / L"tool.exe"));
+}
+
 // The uninstall path must recognise a shim that links the forwarder: it used
 // to compare every usr\bin entry against winuxcmd.exe only, so a forwarder
 // package could never be uninstalled and left its map entries behind

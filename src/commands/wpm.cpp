@@ -2599,6 +2599,18 @@ auto payload_source_for(const fs::path& extracted, const fs::path& root,
 /// `\usr\bin`: that one carries hundreds of tools and must stay off PATH).
 auto entry_dir(const fs::path& root) -> fs::path { return root / "bin"; }
 
+/// Commands the shim/forwarder pair answers with a fixed argv prefix before
+/// the payload sees its arguments (unixwin/niubash#467: ezwinports gawk is a
+/// text-mode mingw build, and `-v BINMODE=3` is the only runtime lever it
+/// honors for binary stdio). Their PATH-entry link must route through a
+/// forwarder as well, or `bin\<cmd>` would reach the payload unadapted.
+/// Mirrors the adapter table in src/shims/winuxcmd_shim.cpp and
+/// opt_forward_argv_prefix in src/Main/main.cpp.
+auto opt_forward_adapted(std::string_view command) -> bool {
+  const std::string lowered = lower_ascii(std::string(command));
+  return lowered == "awk" || lowered == "gawk";
+}
+
 /// Where each command of a package resolves inside its payload, paired with
 /// the entry link the host PATH needs: `<root>/bin/<cmd>` as a hardlink to the
 /// real binary - never a launcher (a link is free, a forwarding process costs
@@ -2619,6 +2631,16 @@ auto package_entry_links(const fs::path& root, const nlohmann::json& pkg,
     fs::path payload;
     if (artifact_layout(artifact) == "shim") {
       payload = package_payload_dir(root, package) / exe_suffix(command);
+      // unixwin/niubash#467: commands the forwarders answer with an argv
+      // adapter (gawk's `-v BINMODE=3`) must route the PATH-entry link through
+      // a forwarder as well - a link to the payload itself would bypass the
+      // adapter and leak the payload's raw stdio behaviour. Prefer the small
+      // forwarder; an installation that predates it still forwards correctly
+      // through winuxcmd.exe's opt-payload dispatch.
+      if (opt_forward_adapted(command)) {
+        payload = package_shim_source(root);
+        if (payload.empty()) payload = canonical_winuxcmd_path(root);
+      }
     } else if (artifact.contains("files") && artifact["files"].is_array()) {
       // Flat layouts map the command binary itself; that mapping's destination
       // is the payload copy.
