@@ -1,5 +1,7 @@
 # Option Handling Guide
 
+> Portal: [unixwin.dev](https://unixwin.dev) — Docs & downloads
+
 ## Overview
 
 This guide explains how to use the option handling system in the WinuxCmd project. With the new pipeline-based architecture, option handling is more streamlined and type-safe, providing a consistent way to handle command-line options across all commands.

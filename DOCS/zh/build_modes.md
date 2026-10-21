@@ -1,5 +1,7 @@
 # 构建模式配置说明
 
+> 门户：[unixwin.dev](https://unixwin.dev) — 文档与下载 (Docs & downloads)
+
 ## 概述
 
 WinuxCmd 现在支持两种构建模式：**开发模式**(DEV) 和 **发布模式**(RELEASE)，每种模式针对不同的使用场景进行了优化。
