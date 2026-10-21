@@ -1798,8 +1798,12 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
       cfg.temporary_directory_hint.empty()
           ? std::filesystem::temp_directory_path()
           // Wide form: the narrow path ctor decodes via the system ACP (#88).
+          // The hint is an argv operand: fold dialect spellings ("/e/...")
+          // here so the derived chunk paths carry the native form that
+          // std::filesystem::remove resolves below.
           : std::filesystem::path(
-                utf8_to_wstring(cfg.temporary_directory_hint));
+                utf8_to_wstring(native_path::normalize_api_operand(
+                    cfg.temporary_directory_hint)));
   auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
     if (records.empty()) return true;
     auto before = [&](const std::string& a, const std::string& b) {
@@ -1918,7 +1922,9 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   }
   output->flush();
   runs.clear();
-  for (const auto& path : temporary_paths) std::filesystem::remove(path);
+  for (const auto& path : temporary_paths)
+    std::filesystem::remove(std::filesystem::path(utf8_to_wstring(
+        native_path::normalize_api_operand(wstring_to_utf8(path.wstring())))));
   if (stdout_mode != -1) _setmode(_fileno(stdout), stdout_mode);
   return 0;
 }
