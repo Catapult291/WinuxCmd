@@ -456,6 +456,12 @@ static int printHelp() noexcept {
   if (const auto hint = winux::i18n::locale_hint(); !hint.empty()) {
     safePrintLn(color ? colorizeStdout(hint, subtle_style) : hint);
   }
+
+  // GNU-style tail: the portal link is the stable last line of every help
+  // variant (bare `winuxcmd`, `--help`, `help` alias).
+  const auto home =
+      winux::i18n::translate("common.home", "Home: <https://unixwin.dev>");
+  safePrintLn(color ? colorizeStdout(home, subtle_style) : home);
   return 1;
 }
 

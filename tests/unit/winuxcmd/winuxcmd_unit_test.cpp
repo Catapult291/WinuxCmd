@@ -41,6 +41,34 @@ TEST(winuxcmd, winuxcmd_help_command_topic_shows_command_help) {
   EXPECT_TRUE(r.stdout_text.find("--compress-program") != std::string::npos);
 }
 
+// GNU-style footer: every help variant (top-level --help, the help <topic>
+// alias, and each applet's --help through the shared formatter) ends with
+// the unixwin portal link.
+TEST(winuxcmd, help_outputs_end_with_unixwin_home_link) {
+  {
+    Pipeline p;
+    p.set_env(L"WINUX_LANG", L"en");  // suppress the machine-dependent hint
+    p.add(L"winuxcmd.exe", {L"--help"});
+    auto r = p.run();
+    EXPECT_EQ(r.exit_code, 1);
+    EXPECT_TRUE(r.stdout_text.ends_with("Home: <https://unixwin.dev>\n"));
+  }
+  {
+    Pipeline p;
+    p.add(L"ls.exe", {L"--help"});
+    auto r = p.run();
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_CONTAINS(r.stdout_text, "Home: <https://unixwin.dev>");
+  }
+  {
+    Pipeline p;
+    p.add(L"winuxcmd.exe", {L"help", L"sort"});
+    auto r = p.run();
+    EXPECT_EQ(r.exit_code, 0);
+    EXPECT_CONTAINS(r.stdout_text, "Home: <https://unixwin.dev>");
+  }
+}
+
 TEST(winuxcmd, winuxcmd_help_works_for_positional_sentinel_options) {
   // Commands whose only OptionMeta is a positional sentinel (empty short and
   // long names, non-empty description) used to make print_help throw

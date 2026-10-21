@@ -313,6 +313,9 @@ auto format_help_text(std::string_view name, std::string_view synopsis,
                       "common.about",
                       "is a Windows implementation of GNU CoreUtils for "
                       "Linux-Windows developers and AI coding assistants.");
+  result += "\n";
+  result +=
+      winux::i18n::translate("common.home", "Home: <https://unixwin.dev>");
 
   return result;
 }
@@ -541,6 +544,10 @@ export auto format_custom_help(std::string_view name, std::string_view help)
                         "common.about",
                         "is a Windows implementation of GNU CoreUtils for "
                         "Linux-Windows developers and AI coding assistants.");
+    result += "\n";
+    result +=
+        winux::i18n::translate("common.home", "Home: <https://unixwin.dev>");
+    result += "\n";
   }
   return result;
 }
