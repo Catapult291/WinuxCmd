@@ -67,21 +67,84 @@ static void printCommandSummary(std::string_view name, std::string_view desc,
   }
 }
 
+// unixwin/niubash#467: opt/ payloads that need a fixed argv prefix to match
+// the rest of the command layer. ezwinports gawk is a text-mode mingw build -
+// its CRT turns every \n into \r\n on write and folds \r\n into \n on read,
+// while every winuxcmd applet does binary stdio. The build carries gawk's
+// BINMODE feature (it ignores the BINMODE environment variable but honors
+// `-v BINMODE=3`), so the switch moves stdin/stdout/stderr - and files the
+// program opens for writing - to binary and the bytes match GNU awk. The
+// prefix goes ahead of the caller's arguments so an explicit
+// `-v BINMODE=...` still wins: later assignments override earlier ones.
+// Mirrors kArgvAdapters in src/shims/winuxcmd_shim.cpp, the path the small
+// forwarder takes.
+static bool name_iequals(std::string_view name, std::string_view literal) noexcept {
+  if (name.size() != literal.size()) return false;
+  for (size_t i = 0; i < name.size(); ++i) {
+    char c = name[i];
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    if (c != literal[i]) return false;
+  }
+  return true;
+}
+
+static std::wstring_view opt_forward_argv_prefix(std::string_view name) noexcept {
+  constexpr std::wstring_view kGawkPrefix = L" -v BINMODE=3";
+  if (name_iequals(name, "awk") || name_iequals(name, "gawk")) return kGawkPrefix;
+  return {};
+}
+
+/// Skip `count` leading whitespace-separated tokens of a Windows command
+/// line, honouring the double-quoted token form. Used to drop the program
+/// token - and, when the command came in through the `winuxcmd <verb>` form,
+/// the verb as well - before the rest is forwarded verbatim.
+static std::wstring_view skip_command_line_tokens(std::wstring_view raw,
+                                                  size_t count) noexcept {
+  while (count-- > 0) {
+    const size_t begin = raw.find_first_not_of(L" \t");
+    if (begin == std::wstring_view::npos) return {};
+    raw.remove_prefix(begin);
+    if (raw[0] == L'"') {
+      const size_t closing = raw.find(L'"', 1);
+      if (closing == std::wstring_view::npos) return {};
+      raw.remove_prefix(closing + 1);
+    } else {
+      const size_t space = raw.find_first_of(L" \t");
+      if (space == std::wstring_view::npos) return {};
+      raw.remove_prefix(space);
+    }
+  }
+  const size_t start = raw.find_first_not_of(L" \t");
+  return start == std::wstring_view::npos ? std::wstring_view{} : raw.substr(start);
+}
+
 // Shim-layout packages (installed via `wpm install` with artifact
 // layout=shim) keep their payload self-contained under <root>\opt\<pkg>\.
 // The command entry in usr\bin is a plain hardlink of winuxcmd.exe; when the
 // invoked name is not a registered command, we forward to
 // <root>\opt\<name>\<name>.exe so the payload's private DLLs resolve from its
 // own directory. Returns nullopt when no payload exists (caller falls back to
-// the regular command-not-found path).
-static std::optional<int> forwardToOptPayload(std::string_view name) noexcept {
+// the regular command-not-found path). `via_verb` marks the
+// `winuxcmd <name>` form, where the command line still carries the verb token
+// ahead of the real arguments.
+static std::optional<int> forwardToOptPayload(std::string_view name,
+                                              bool via_verb) noexcept {
   namespace fs = std::filesystem;
   wchar_t buffer[MAX_PATH];
   const DWORD size = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
   if (size == 0 || size >= MAX_PATH) return std::nullopt;
   const fs::path self(buffer);
-  // <root>\usr\bin\<self>.exe -> <root>
-  const fs::path root = self.parent_path().parent_path().parent_path();
+  // Canonical placement is <root>\usr\bin\<self>.exe, three directories below
+  // the root. Commands forwarded through an argv adapter may also sit at
+  // <root>\bin\<self>.exe (the PATH-entry link wpm points at a forwarder for
+  // them, unixwin/niubash#467), one level closer - probe the canonical depth
+  // first, then the shallower one, for the opt\ tree.
+  const fs::path root_canonical = self.parent_path().parent_path().parent_path();
+  std::error_code root_ec;
+  const fs::path root =
+      fs::is_directory(root_canonical / L"opt", root_ec)
+          ? root_canonical
+          : self.parent_path().parent_path();
 
   const fs::path payload_direct =
       root / L"opt" / utf8_to_wstring(std::string(name)) /
@@ -174,23 +237,12 @@ static std::optional<int> forwardToOptPayload(std::string_view name) noexcept {
   }
 
   // Rebuild the child command line from the raw one so the original quoting
-  // of every argument is preserved verbatim.
+  // of every argument is preserved verbatim. `winuxcmd <name> args` carries
+  // one extra token (the verb) the payload must never see.
   const std::wstring raw = GetCommandLineW();
-  std::wstring rest;
-  if (!raw.empty()) {
-    size_t start = std::wstring::npos;
-    if (raw[0] == L'"') {
-      const size_t closing = raw.find(L'"', 1);
-      if (closing != std::wstring::npos)
-        start = raw.find_first_not_of(L' ', closing + 1);
-    } else {
-      const size_t space = raw.find_first_of(L" \t");
-      if (space != std::wstring::npos)
-        start = raw.find_first_not_of(L" \t", space);
-    }
-    if (start != std::wstring::npos) rest = raw.substr(start);
-  }
-  std::wstring command_line = L"\"" + payload.wstring() + L"\"";
+  const std::wstring rest(skip_command_line_tokens(raw, via_verb ? 2 : 1));
+  std::wstring command_line = L"\"" + payload.wstring() + L"\"" +
+                              std::wstring(opt_forward_argv_prefix(name));
   if (!rest.empty()) command_line += L" " + rest;
 
   STARTUPINFOW si{};
@@ -552,7 +604,7 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
 
     if (!CommandRegistry::hasCommand(cmd_name)) {
       // Not a builtin: try forwarding to a shim-layout payload first.
-      if (auto forwarded = forwardToOptPayload(cmd_name)) {
+      if (auto forwarded = forwardToOptPayload(cmd_name, /*via_verb=*/true)) {
         return *forwarded;
       }
       safeErrorPrintLn(winux::i18n::format("core.error.command_not_found",
@@ -571,7 +623,7 @@ int wmain(int argc, wchar_t* wargv[]) noexcept {
 
     // Not a builtin: try forwarding to a shim-layout payload first.
     if (!CommandRegistry::hasCommand(self_name)) {
-      if (auto forwarded = forwardToOptPayload(self_name)) {
+      if (auto forwarded = forwardToOptPayload(self_name, /*via_verb=*/false)) {
         return *forwarded;
       }
     }
