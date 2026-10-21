@@ -454,7 +454,8 @@ auto open_input_file(const std::string& file) -> std::ifstream {
 
 auto describe_open_failure(const std::string& file) -> std::string {
   std::wstring wfile = utf8_to_wstring(file);
-  DWORD attrs = native_path::attributes_w(utf8_to_wstring(file));
+  DWORD attrs = native_path::attributes_w(
+      utf8_to_wstring(native_path::normalize_api_operand(file)));
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return "No such file or directory";
   }

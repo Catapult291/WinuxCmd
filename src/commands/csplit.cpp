@@ -157,7 +157,8 @@ auto read_records(const std::string& filename)
       return std::unexpected("error reading from file");
     }
   } else {
-    std::ifstream f(filename, std::ios::binary);
+    std::ifstream f(native_path::normalize_api_operand(filename),
+                    std::ios::binary);
     if (!f) {
       return std::unexpected(std::string("cannot open '") + filename +
                              "' for reading");

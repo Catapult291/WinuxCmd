@@ -213,7 +213,9 @@ auto read_input(const std::string& filename) -> cp::Result<std::string> {
   std::string content;
   auto input_open_error = [](std::string_view path) -> std::string {
     std::error_code ec;
-    if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) &&
+    if (std::filesystem::is_directory(
+            std::filesystem::u8path(native_path::normalize_api_operand(path)),
+            ec) &&
         !ec) {
       return std::string("cannot open '") + std::string(path) +
              "' for reading: Is a directory";

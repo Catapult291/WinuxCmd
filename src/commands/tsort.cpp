@@ -32,7 +32,8 @@ REGISTER_COMMAND(tsort,
   } else {
     // Read from file
     std::string filename = std::string(ctx.positionals[0]);
-    std::wstring wfilename = utf8_to_wstring(filename);
+    std::wstring wfilename =
+        utf8_to_wstring(native_path::normalize_api_operand(filename));
     HANDLE hFile =
         CreateFileW(wfilename.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);

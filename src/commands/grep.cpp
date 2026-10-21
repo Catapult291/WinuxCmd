@@ -2092,7 +2092,11 @@ auto scan_fixed_file_fast(const std::string& path,
                           std::string_view display_name, bool show_filename,
                           Config& cfg) -> cp::Result<std::pair<bool, size_t>> {
   using FilePtr = std::unique_ptr<FILE, decltype(&::fclose)>;
-  FilePtr file(_wfopen(utf8_to_wstring(path).c_str(), L"rb"), &::fclose);
+  FilePtr file(
+      _wfopen(utf8_to_wstring(native_path::normalize_api_operand(path))
+                  .c_str(),
+              L"rb"),
+      &::fclose);
   if (!file) {
     return std::unexpected("cannot open '" + path + "'");
   }
@@ -2288,15 +2292,21 @@ auto append_search_path(Config& cfg, std::string_view input,
     return {};
   }
 
+  // Probes and the recursive walk run on the resolved spelling so the MSYS
+  // drive dialect ("/e") names the same target a native spelling would;
+  // `f` keeps the caller's text for exclude matching and diagnostics
+  // (#1230).
+  const std::string resolved = native_path::normalize_api_operand(f);
+
   std::error_code ec;
-  bool is_dir = std::filesystem::is_directory(f, ec);
+  bool is_dir = std::filesystem::is_directory(resolved, ec);
   if (ec) {
     out.push_back(f);
     return {};
   }
 
   if (!is_dir) {
-    bool is_regular = std::filesystem::is_regular_file(f, ec);
+    bool is_regular = std::filesystem::is_regular_file(resolved, ec);
     if (!ec && !is_regular && cfg.devices == "skip") return {};
     if (!should_search_file(cfg, f)) return {};
     out.push_back(f);
@@ -2322,7 +2332,8 @@ auto append_search_path(Config& cfg, std::string_view input,
       std::wstring dir;      // directory whose files we read next
       std::wstring dir_arg;  // as spelled for exclude matching
     };
-    std::vector<Pending> pending{{utf8_to_wstring(f), utf8_to_wstring(f)}};
+    std::vector<Pending> pending{
+        {utf8_to_wstring(resolved), utf8_to_wstring(f)}};
     std::set<std::wstring> visited_dirs;  // canonical real paths
     auto is_reparse_dir = [](const std::filesystem::path& p) {
       DWORD attrs = GetFileAttributesW(p.c_str());

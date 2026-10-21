@@ -340,7 +340,8 @@ auto extract_strings_from_file(const std::string& filename, const Config& cfg)
     }
   } else {
     // Read from file
-    std::ifstream file(filename, std::ios::binary);
+    std::ifstream file(native_path::normalize_api_operand(filename),
+                       std::ios::binary);
     if (!file) {
       safeErrorPrint("strings: '");
       safeErrorPrint(filename);

@@ -42,7 +42,9 @@ auto build_config(const CommandContext<HMAC256_OPTIONS.size()>& ctx)
 
 auto input_open_error(const std::string& filename) -> std::string {
   std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(filename), ec) &&
+  if (std::filesystem::is_directory(
+          std::filesystem::u8path(native_path::normalize_api_operand(filename)),
+          ec) &&
       !ec) {
     return "cannot open \x27" + filename + "\x27 for reading: Is a directory";
   }
@@ -54,7 +56,8 @@ auto run(const Config& cfg) -> int {
   std::istream* input = &std::cin;
   std::ifstream file;
   if (cfg.filename != "-") {
-    file.open(cfg.filename, std::ios::binary);
+    file.open(native_path::normalize_api_operand(cfg.filename),
+              std::ios::binary);
     if (!file) {
       safeErrorPrint("hmac256: ");
       safeErrorPrintLn(input_open_error(cfg.filename));

@@ -59,7 +59,8 @@ std::vector<unsigned char> read_stdin_bytes() {
 
 std::optional<std::vector<unsigned char>> read_file_bytes(
     const std::string& filename) {
-  std::wstring wfilename = utf8_to_wstring(filename);
+  std::wstring wfilename =
+      utf8_to_wstring(native_path::normalize_api_operand(filename));
   HANDLE hFile =
       CreateFileW(wfilename.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -398,7 +399,8 @@ REGISTER_COMMAND(xxd,
     HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
     HANDLE output_file = INVALID_HANDLE_VALUE;
     if (cfg.output_file) {
-      const auto output_name = utf8_to_wstring(*cfg.output_file);
+      const auto output_name =
+          utf8_to_wstring(native_path::normalize_api_operand(*cfg.output_file));
       output_file = CreateFileW(output_name.c_str(), GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
       if (output_file == INVALID_HANDLE_VALUE) {

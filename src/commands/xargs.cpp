@@ -871,7 +871,8 @@ auto report_xargs_input_file_open_error(std::string_view path) -> void {
   safeErrorPrint("': ");
 
   std::error_code ec;
-  auto status = std::filesystem::status(utf8_to_wstring(std::string(path)), ec);
+  auto status = std::filesystem::status(
+      utf8_to_wstring(native_path::normalize_api_operand(path)), ec);
   if (ec) {
     safeErrorPrint(xargs_windows_error_text(static_cast<DWORD>(ec.value())));
   } else if (status.type() == std::filesystem::file_type::not_found) {
@@ -1311,7 +1312,8 @@ REGISTER_COMMAND(
   std::ifstream arg_input;
   std::istream *input = &std::cin;
   if (!arg_file.empty()) {
-    arg_input.open(arg_file, std::ios::binary);
+    arg_input.open(native_path::normalize_api_operand(arg_file),
+                   std::ios::binary);
     if (!arg_input.is_open()) {
       report_xargs_input_file_open_error(arg_file);
       return 1;

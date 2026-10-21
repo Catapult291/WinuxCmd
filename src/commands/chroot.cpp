@@ -46,7 +46,8 @@ auto build_config(const CommandContext<CHROOT_OPTIONS.size()>& ctx)
   }
 
   cfg.newroot = std::string(ctx.positionals[0]);
-  std::filesystem::path root_path(cfg.newroot);
+  std::filesystem::path root_path(
+      utf8_to_wstring(native_path::normalize_api_operand(cfg.newroot)));
 
   std::error_code ec;
   bool exists = std::filesystem::exists(root_path, ec);

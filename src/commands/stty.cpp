@@ -404,10 +404,12 @@ auto run(const Config& cfg) -> int {
 
   if (!cfg.device.empty()) {
     std::error_code ec;
-    if (!std::filesystem::exists(cfg.device, ec)) {
+    const std::string device_path =
+        native_path::normalize_api_operand(cfg.device);
+    if (!std::filesystem::exists(device_path, ec)) {
       return report_missing_device(cfg.device);
     }
-    std::wstring wdevice = utf8_to_wstring(cfg.device);
+    std::wstring wdevice = utf8_to_wstring(device_path);
     hCon = CreateFileW(wdevice.c_str(), GENERIC_READ | GENERIC_WRITE,
                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
