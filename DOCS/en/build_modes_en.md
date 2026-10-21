@@ -1,5 +1,7 @@
 # Build Modes Configuration Guide
 
+> Portal: [unixwin.dev](https://unixwin.dev) — Docs & downloads
+
 ## Overview
 
 WinuxCmd now supports two build modes: **Development mode** (DEV) and **Release mode** (RELEASE), each optimized for different usage scenarios.

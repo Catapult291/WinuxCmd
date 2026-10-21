@@ -1,5 +1,7 @@
 # WPM — WinuxCmd Package Manager User Guide
 
+> Portal: [unixwin.dev](https://unixwin.dev) — Docs & downloads
+
 > **Version:** 0.3.0 | **License:** MIT | **Copyright:** 2026 WinuxCmd Project
 
 ---

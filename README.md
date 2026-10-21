@@ -8,6 +8,8 @@
 No WSL · No Cygwin · No MSYS2 · No path-translation pain
 **v1.0.0 stable is out.** 🎉
 
+**[unixwin.dev](https://unixwin.dev) — Docs & downloads**
+
 [![GitHub release](https://img.shields.io/github/v/release/unixwin/WinuxCmd)](https://github.com/unixwin/WinuxCmd/releases)
 [![GitHub downloads](https://img.shields.io/github/downloads/unixwin/WinuxCmd/total)](https://github.com/unixwin/WinuxCmd/releases)
 [![Stars](https://img.shields.io/github/stars/unixwin/WinuxCmd)](https://github.com/unixwin/WinuxCmd/stargazers)

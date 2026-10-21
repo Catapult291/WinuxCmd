@@ -8,6 +8,8 @@
 无需 WSL · 无需 Cygwin · 无需 MSYS2 · 没有路径转换的坑
 **v1.0.0 正式版已发布。** 🎉
 
+**[unixwin.dev](https://unixwin.dev) — 文档与下载 (Docs & downloads)**
+
 [![GitHub release](https://img.shields.io/github/v/release/unixwin/WinuxCmd)](https://github.com/unixwin/WinuxCmd/releases)
 [![GitHub downloads](https://img.shields.io/github/downloads/unixwin/WinuxCmd/total)](https://github.com/unixwin/WinuxCmd/releases)
 [![Stars](https://img.shields.io/github/stars/unixwin/WinuxCmd)](https://github.com/unixwin/WinuxCmd/stargazers)
