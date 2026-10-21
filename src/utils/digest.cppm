@@ -52,7 +52,12 @@ namespace detail {
 // opened (EACCES), otherwise "No such file or directory" (ENOENT).
 auto open_failure_reason(std::string_view path) -> std::string {
   std::error_code ec;
-  const std::filesystem::path fs_path = std::filesystem::u8path(path);
+  // Probe the operand's resolved spelling: the drive dialect ("/e") names
+  // the same target the failed open was attempted on, while the raw text
+  // decays to a cwd-drive-relative path and misclassifies the failure
+  // (#1230).
+  const std::filesystem::path fs_path =
+      std::filesystem::u8path(native_path::normalize_api_operand(path));
   if (std::filesystem::is_directory(fs_path, ec) && !ec) {
     return "Is a directory";
   }

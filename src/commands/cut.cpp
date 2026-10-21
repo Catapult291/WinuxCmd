@@ -183,7 +183,10 @@ auto is_whole_span_selected(size_t first_byte, size_t last_byte,
 
 auto cut_input_open_error(std::string_view input_path) -> std::string {
   std::error_code ec;
-  if (std::filesystem::is_directory(std::filesystem::u8path(input_path), ec) &&
+  if (std::filesystem::is_directory(
+          std::filesystem::u8path(
+              native_path::normalize_api_operand(input_path)),
+          ec) &&
       !ec) {
     return "cannot open '" + std::string(input_path) +
            "' for reading: Is a directory";

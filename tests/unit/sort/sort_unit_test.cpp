@@ -1088,3 +1088,57 @@ TEST(sort, sort_stdin_ctrlz_matches_file_operand_issue1212) {
   EXPECT_FALSE(rf.stdout_text.empty());
   EXPECT_EQ(rs.stdout_text, rf.stdout_text);
 }
+
+namespace {
+
+// #1230: the MSYS single-letter drive spelling of a native directory
+// ("D:\tmp\x" -> "/d/tmp/x"). The dialect operand must resolve to the
+// named directory regardless of the cwd's drive.
+auto drive_dialect_dir_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+}  // namespace
+
+// #1230: a "-T /d/..." dialect hint must drive chunk creation and cleanup
+// through the same resolved spelling. Before the fix the validation probe
+// and file_io folded "/d/..." onto the named drive while the final
+// std::filesystem::remove resolved the raw "\d\..." spelling against the
+// cwd drive — a silent no-op that leaked every spill chunk.
+TEST(sort, sort_temporary_directory_dialect_hint_cleans_spill_chunks) {
+  TempDir tmp;
+  TempDir cwd;
+  cwd.write("in.txt", "3\n1\n2\n");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  // -s keeps the single-file fast path off (it rejects stable sorts), so
+  // even this small input writes one spill chunk under the hint.
+  p.add(L"sort.exe",
+        {L"-s", L"-T", drive_dialect_dir_spelling(tmp.path), L"in.txt"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "1\n2\n3\n");
+
+  size_t leftovers = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(tmp.path)) {
+    if (entry.path().filename().wstring().find(L"winuxcmd-sort-") == 0) {
+      ++leftovers;
+    }
+  }
+  EXPECT_EQ(leftovers, 0u);
+}

@@ -114,7 +114,8 @@ auto print_ace(ACL* acl, DWORD index, const Config& cfg) -> bool {
 }
 
 auto print_acl_for_file(const std::string& path, const Config& cfg) -> int {
-  std::wstring wpath = utf8_to_wstring(path);
+  std::wstring wpath =
+      utf8_to_wstring(native_path::normalize_api_operand(path));
   PSECURITY_DESCRIPTOR security_desc = nullptr;
   PSID owner_sid = nullptr;
   PSID group_sid = nullptr;

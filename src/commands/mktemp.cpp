@@ -61,15 +61,16 @@ enum class DisplayDialect {
 
 auto display_dialect_of(std::string_view text) -> DisplayDialect {
   auto is_separator = [](char ch) { return ch == '/' || ch == '\\'; };
-  if (text.size() >= 3 && is_separator(text[0]) &&
+  if (text.size() >= 2 && is_separator(text[0]) &&
       std::isalpha(static_cast<unsigned char>(text[1])) &&
-      is_separator(text[2])) {
+      (text.size() == 2 || is_separator(text[2]))) {
     return DisplayDialect::MsysDrive;
   }
   constexpr std::string_view cygdrive = "/cygdrive/";
-  if (text.size() > cygdrive.size() + 1 && text.starts_with(cygdrive) &&
+  if (text.size() >= cygdrive.size() + 1 && text.starts_with(cygdrive) &&
       std::isalpha(static_cast<unsigned char>(text[cygdrive.size()])) &&
-      is_separator(text[cygdrive.size() + 1])) {
+      (text.size() == cygdrive.size() + 1 ||
+       is_separator(text[cygdrive.size() + 1]))) {
     return DisplayDialect::Cygdrive;
   }
   return DisplayDialect::Native;
@@ -113,18 +114,26 @@ auto normalize_win_shell_path(std::string_view text) -> std::string {
     return out;
   };
 
-  if (text.size() >= 3 && (text[0] == '/' || text[0] == '\\') &&
+  if (text.size() >= 2 && (text[0] == '/' || text[0] == '\\') &&
       std::isalpha(static_cast<unsigned char>(text[1])) &&
-      (text[2] == '/' || text[2] == '\\')) {
+      (text.size() == 2 || text[2] == '/' || text[2] == '\\')) {
+    // A bare drive root ("/e") names "E:\" like the "/e/..." deep form;
+    // joining must keep a root separator so the result is not "E:<rel>"
+    // (#1230).
+    if (text.size() == 2) return make_drive_path(text[1], "/");
     return make_drive_path(text[1], text.substr(2));
   }
 
   constexpr std::string_view cygdrive = "/cygdrive/";
-  if (text.size() > cygdrive.size() + 1 && text.starts_with(cygdrive) &&
+  if (text.size() >= cygdrive.size() + 1 && text.starts_with(cygdrive) &&
       std::isalpha(static_cast<unsigned char>(text[cygdrive.size()])) &&
-      (text[cygdrive.size() + 1] == '/' || text[cygdrive.size() + 1] == '\\')) {
+      (text.size() == cygdrive.size() + 1 ||
+       text[cygdrive.size() + 1] == '/' ||
+       text[cygdrive.size() + 1] == '\\')) {
     return make_drive_path(text[cygdrive.size()],
-                           text.substr(cygdrive.size() + 1));
+                           text.size() == cygdrive.size() + 1
+                               ? "/"
+                               : text.substr(cygdrive.size() + 1));
   }
 
   return std::string(text);

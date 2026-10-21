@@ -180,7 +180,8 @@ auto read_all(std::istream& in) -> std::string { return read_text_stream(in); }
 auto describe_input_open_failure(std::string_view path) -> std::string {
   // Probe through the extended API path so >MAX_PATH operands and DOS
   // device names resolve like the open itself (#1061).
-  DWORD attrs = native_path::attributes_w(utf8_to_wstring(std::string(path)));
+  DWORD attrs = native_path::attributes_w(
+      utf8_to_wstring(native_path::normalize_api_operand(path)));
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     return "No such file or directory";
   }
@@ -1292,7 +1293,8 @@ auto validate_temporary_directory_hint(std::string_view text) -> bool {
   if (text.empty()) return false;
 
   std::error_code ec;
-  const auto path = std::filesystem::u8path(text);
+  const auto path =
+      std::filesystem::u8path(native_path::normalize_api_operand(text));
   return std::filesystem::exists(path, ec) &&
          std::filesystem::is_directory(path, ec) && !ec;
 }
@@ -1717,7 +1719,8 @@ auto try_run_simple_lexical_block_sort(const Config& cfg)
 
   std::ofstream file_out;
   if (!cfg.output_file.empty()) {
-    file_out.open(cfg.output_file, std::ios::binary | std::ios::trunc);
+    file_out.open(native_path::normalize_api_operand(cfg.output_file),
+                  std::ios::binary | std::ios::trunc);
     if (!file_out.is_open()) {
       cp::report_custom_error(L"sort", L"cannot open output file");
       return 2;
@@ -1795,8 +1798,12 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
       cfg.temporary_directory_hint.empty()
           ? std::filesystem::temp_directory_path()
           // Wide form: the narrow path ctor decodes via the system ACP (#88).
+          // The hint is an argv operand: fold dialect spellings ("/e/...")
+          // here so the derived chunk paths carry the native form that
+          // std::filesystem::remove resolves below.
           : std::filesystem::path(
-                utf8_to_wstring(cfg.temporary_directory_hint));
+                utf8_to_wstring(native_path::normalize_api_operand(
+                    cfg.temporary_directory_hint)));
   auto make_run = [&](std::vector<std::string>& records) -> cp::Result<bool> {
     if (records.empty()) return true;
     auto before = [&](const std::string& a, const std::string& b) {
@@ -1915,7 +1922,9 @@ auto external_sort(const Config& cfg) -> cp::Result<int> {
   }
   output->flush();
   runs.clear();
-  for (const auto& path : temporary_paths) std::filesystem::remove(path);
+  for (const auto& path : temporary_paths)
+    std::filesystem::remove(std::filesystem::path(utf8_to_wstring(
+        native_path::normalize_api_operand(wstring_to_utf8(path.wstring())))));
   if (stdout_mode != -1) _setmode(_fileno(stdout), stdout_mode);
   return 0;
 }
@@ -1986,7 +1995,8 @@ auto run(const Config& cfg) -> int {
 
   std::ofstream file_out;
   if (!cfg.output_file.empty()) {
-    file_out.open(cfg.output_file, std::ios::binary | std::ios::trunc);
+    file_out.open(native_path::normalize_api_operand(cfg.output_file),
+                  std::ios::binary | std::ios::trunc);
     if (!file_out.is_open()) {
       cp::report_custom_error(L"sort", L"cannot open output file");
       return 2;

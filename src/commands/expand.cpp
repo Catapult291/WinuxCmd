@@ -301,7 +301,9 @@ auto expand_line(const std::string& line, const Config::TabStops& tab_stops,
 auto run(const Config& cfg) -> int {
   auto expand_input_open_error = [](std::string_view path) -> std::string {
     std::error_code ec;
-    auto status = std::filesystem::status(std::filesystem::u8path(path), ec);
+    auto status = std::filesystem::status(
+        std::filesystem::u8path(native_path::normalize_api_operand(path)),
+        ec);
     if (!ec && status.type() == std::filesystem::file_type::directory) {
       return std::string("cannot open '") + std::string(path) +
              "' for reading: Is a directory";
@@ -328,7 +330,8 @@ auto run(const Config& cfg) -> int {
                      std::istreambuf_iterator<char>());
     } else {
       // Read from file
-      std::ifstream f(file, std::ios::binary);
+      std::ifstream f(native_path::normalize_api_operand(file),
+                      std::ios::binary);
       if (!f) {
         auto err = expand_input_open_error(file);
         cp::Result<int> result = std::unexpected(err);

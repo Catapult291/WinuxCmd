@@ -1760,7 +1760,9 @@ auto compare_directory_pair(const std::string &dir1, const std::string &dir2,
   auto list_directory =
       [](const std::string &dir) -> std::optional<std::vector<std::string>> {
     std::error_code ec;
-    fs::directory_iterator it(fs::path(dir), ec);
+    fs::directory_iterator it(
+        fs::path(utf8_to_wstring(native_path::normalize_api_operand(dir))),
+        ec);
     if (ec) return std::nullopt;
     std::vector<std::string> names;
     for (const auto &entry : it) {

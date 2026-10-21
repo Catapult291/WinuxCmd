@@ -375,7 +375,9 @@ auto run(const Config& cfg) -> int {
   bool all_ok = true;
   auto input_open_error = [](std::string_view path) -> std::string {
     std::error_code ec;
-    if (std::filesystem::is_directory(std::filesystem::u8path(path), ec) &&
+    if (std::filesystem::is_directory(
+            std::filesystem::u8path(native_path::normalize_api_operand(path)),
+            ec) &&
         !ec) {
       return "cannot open '" + std::string(path) +
              "' for reading: Is a directory";
@@ -395,7 +397,8 @@ auto run(const Config& cfg) -> int {
                      std::istreambuf_iterator<char>());
     } else {
       // Read from file
-      std::ifstream f(file, std::ios::binary);
+      std::ifstream f(native_path::normalize_api_operand(file),
+                      std::ios::binary);
       if (!f) {
         auto err = input_open_error(file);
         cp::Result<int> result = std::unexpected(err);

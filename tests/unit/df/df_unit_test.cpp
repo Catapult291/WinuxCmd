@@ -463,3 +463,83 @@ TEST(df, df_obsolete_F_synonym_for_type) {
   EXPECT_EQ(rt.exit_code, 0);
   EXPECT_EQ(rf.stdout_text.empty(), rt.stdout_text.empty());
 }
+
+namespace {
+
+// #1230: the MSYS single-letter drive spelling of a drive root
+// ("D:\" -> "/d"). A bare root ("/d", "/d/") must resolve to the named
+// volume regardless of the cwd's drive.
+auto drive_dialect_root_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  return dialect;
+}
+
+void clear_shell_root_env(Pipeline& pipeline) {
+  for (const auto* name :
+       {L"__RUBASH_SHELL_ROOT", L"NIU_ROOT", L"WINUXSH_ROOT", L"RUBASH_ROOT"}) {
+    pipeline.set_env(name, L"");
+  }
+}
+
+}  // namespace
+
+// #1230: a bare drive-root operand ("/x") folded to the cwd's drive before
+// the fix — the dialect recognizer only handled "/x/..." deep paths.
+TEST(df, df_bare_drive_root_operand_reports_named_volume) {
+  TempDir dir;
+  TempDir cwd;
+
+  const std::wstring root_dialect = drive_dialect_root_spelling(dir.path);
+  const wchar_t drive = root_dialect[1];
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"df.exe", {root_dialect});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("df bare drive root output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_NE(r.stdout_text.find("Filesystem"), std::string::npos);
+  // The volume row names the operand's drive ("D:\"), not the cwd drive.
+  std::string expected;
+  expected.push_back(
+      static_cast<char>(drive >= L'a' ? drive - L'a' + L'A' : drive));
+  expected += ":\\";
+  EXPECT_NE(r.stdout_text.find(expected), std::string::npos);
+}
+
+TEST(df, df_trailing_slash_drive_root_operand_reports_named_volume) {
+  TempDir dir;
+  TempDir cwd;
+
+  const std::wstring root_dialect =
+      drive_dialect_root_spelling(dir.path) + L"/";
+  const wchar_t drive = root_dialect[1];
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  clear_shell_root_env(p);
+  p.add(L"df.exe", {root_dialect});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  TEST_LOG("df trailing-slash drive root output", r.stdout_text);
+
+  EXPECT_EQ(r.exit_code, 0);
+  std::string expected;
+  expected.push_back(
+      static_cast<char>(drive >= L'a' ? drive - L'a' + L'A' : drive));
+  expected += ":\\";
+  EXPECT_NE(r.stdout_text.find(expected), std::string::npos);
+}

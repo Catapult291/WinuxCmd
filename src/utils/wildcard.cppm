@@ -9,6 +9,7 @@ export module utils:wildcard;
 import std;
 import :utf8;
 import :path;
+import :native_path;
 
 #ifndef INVALID_HANDLE_VALUE
 #define INVALID_HANDLE_VALUE HANDLE(-1)
@@ -291,6 +292,12 @@ export struct GlobResult {
 export GlobResult glob_expand(std::wstring_view pattern) {
   GlobResult result;
 
+  // Fold the MSYS drive dialect before any literal-exists probe or
+  // component walk: a "/e/*" pattern must enumerate E:\, not a
+  // cwd-drive-relative "\e\*" tree (#1230).
+  const std::wstring normalized_pattern =
+      native_path::normalize_api_operand_w(pattern);
+
   if (wildcard_impl::shell_owns_glob_expansion()) {
     result.files.push_back(std::wstring(pattern));
     result.expanded = false;
@@ -301,30 +308,31 @@ export GlobResult glob_expand(std::wstring_view pattern) {
   // even if a literal "[ab].txt" path exists, treat it as a glob first so it
   // can still match "a.txt"/"b.txt". Literal fallback remains in place when
   // the expansion finds nothing.
-  bool has_char_class = (pattern.find(L'[') != std::wstring_view::npos);
+  bool has_char_class =
+      (normalized_pattern.find(L'[') != std::wstring_view::npos);
   bool has_path_separator =
-      pattern.find_first_of(L"\\/") != std::wstring_view::npos;
+      normalized_pattern.find_first_of(L"\\/") != std::wstring_view::npos;
 
   // 1. First try as literal file path
   std::error_code ec;
-  if (!has_char_class && std::filesystem::exists(pattern, ec)) {
-    result.files.push_back(std::wstring(pattern));
+  if (!has_char_class && std::filesystem::exists(normalized_pattern, ec)) {
+    result.files.push_back(normalized_pattern);
     result.expanded = false;  // Not expanded, literal path
     return result;
   }
 
   if (has_char_class || has_path_separator) {
-    result.files = wildcard_impl::expand_path_components(pattern);
+    result.files = wildcard_impl::expand_path_components(normalized_pattern);
     result.expanded = !result.files.empty();
 
     // If no files matched, return original pattern as literal
     if (result.files.empty()) {
-      result.files.push_back(std::wstring(pattern));
+      result.files.push_back(normalized_pattern);
       result.expanded = false;
     }
   } else {
     // Use FindFirstFileW for * and ? patterns (faster)
-    std::wstring pattern_str(pattern);
+    std::wstring pattern_str(normalized_pattern);
     WIN32_FIND_DATAW find_data;
     HANDLE hFind = FindFirstFileW(pattern_str.c_str(), &find_data);
 
@@ -359,12 +367,12 @@ export GlobResult glob_expand(std::wstring_view pattern) {
 
       // If no files matched, return original pattern as literal
       if (result.files.empty()) {
-        result.files.push_back(std::wstring(pattern));
+        result.files.push_back(normalized_pattern);
         result.expanded = false;
       }
     } else {
       // Expansion failed, return original literal value
-      result.files.push_back(std::wstring(pattern));
+      result.files.push_back(normalized_pattern);
       result.expanded = false;
     }
   }

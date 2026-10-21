@@ -130,7 +130,7 @@ auto run(const Config& cfg) -> int {
 
   if (!cfg.file.empty()) {
     // Read hostname from file
-    std::ifstream ifs(cfg.file);
+    std::ifstream ifs(native_path::normalize_api_operand(cfg.file));
     if (!ifs) {
       WSACleanup();
       cp::Result<int> result =

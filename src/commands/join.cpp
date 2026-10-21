@@ -190,7 +190,9 @@ auto trim_text_record(std::string line, char delimiter) -> std::string {
 
 auto join_input_open_error(std::string_view filename) -> std::string {
   std::error_code ec;
-  auto status = std::filesystem::status(std::filesystem::u8path(filename), ec);
+  auto status = std::filesystem::status(
+      std::filesystem::u8path(native_path::normalize_api_operand(filename)),
+      ec);
   if (!ec && status.type() == std::filesystem::file_type::directory) {
     return std::string(filename) + ": Is a directory";
   }

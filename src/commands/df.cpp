@@ -893,8 +893,18 @@ auto print_total_row(uint64_t total, uint64_t used, uint64_t available,
  */
 auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
     -> cp::Result<bool> {
+  // Each operand keeps two spellings: the as-typed text echoed in
+  // diagnostics and the "file" output field, and the native spelling every
+  // filesystem call receives. Routing the latter through the shared argv
+  // operand boundary folds the MSYS drive dialect ("/e", "/e/") onto "E:\"
+  // like any deeper path, instead of letting a bare drive root decay to a
+  // cwd-drive-relative name (#1230).
+  struct OperandPath {
+    std::string display;
+    std::string api;
+  };
   // Use SmallVector for file paths (max 32 drives) - all stack-allocated
-  SmallVector<std::string, 32> paths{};
+  SmallVector<OperandPath, 32> paths{};
   const bool auto_enumerated_drives = ctx.positionals.empty();
 
   if (auto_enumerated_drives) {
@@ -904,10 +914,12 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
     }
     for (unsigned int index = 0; index < 26; ++index) {
       if ((logical_drives & (1u << index)) == 0) continue;
-      std::string root;
-      root.push_back(static_cast<char>('A' + index));
-      root += ":\\";
-      if (GetDriveTypeW(utf8_to_wstring(root).c_str()) != DRIVE_NO_ROOT_DIR) {
+      OperandPath root;
+      root.display.push_back(static_cast<char>('A' + index));
+      root.display += ":\\";
+      root.api = root.display;
+      if (GetDriveTypeW(utf8_to_wstring(root.api).c_str()) !=
+          DRIVE_NO_ROOT_DIR) {
         paths.push_back(std::move(root));
       }
     }
@@ -917,16 +929,19 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
   } else {
     for (const auto& arg : ctx.positionals) {
       std::string file_arg(arg);
-      if (contains_wildcard(file_arg)) {
-        auto glob_result = glob_expand(file_arg);
+      const auto operand = native_path::make_api_path_operand(file_arg);
+      if (contains_wildcard(operand.normalized)) {
+        auto glob_result = glob_expand(operand.normalized);
         if (glob_result.expanded) {
           for (const auto& file : glob_result.files) {
-            paths.push_back(wstring_to_utf8(file));
+            const std::string expanded = wstring_to_utf8(file);
+            paths.push_back({expanded, expanded});
           }
           continue;
         }
       }
-      paths.push_back(file_arg);
+      paths.push_back(
+          {std::move(file_arg), wstring_to_utf8(operand.normalized)});
     }
   }
 
@@ -1029,7 +1044,7 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
     // on a non-directory reports "df: <path>: Not a directory"; the run
     // fails (exit 1) but valid operands are still listed (uutils #12777).
     if (!auto_enumerated_drives) {
-      std::wstring wpath = utf8_to_wstring(path);
+      std::wstring wpath = utf8_to_wstring(path.api);
       std::wstring lookup = wpath;
       bool needs_directory = false;
       while (lookup.size() > 1 &&
@@ -1042,26 +1057,26 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
           std::filesystem::status(std::filesystem::path(lookup), ec);
       if (ec || !std::filesystem::exists(status)) {
         safeErrorPrint("df: ");
-        safeErrorPrint(path);
+        safeErrorPrint(path.display);
         safeErrorPrint(": No such file or directory\n");
         all_ok = false;
         continue;
       }
       if (needs_directory && !std::filesystem::is_directory(status)) {
         safeErrorPrint("df: ");
-        safeErrorPrint(path);
+        safeErrorPrint(path.display);
         safeErrorPrint(": Not a directory\n");
         all_ok = false;
         continue;
       }
     }
 
-    auto disk_info = get_disk_info(path);
+    auto disk_info = get_disk_info(path.api);
 
     if (!disk_info) {
       if (!auto_enumerated_drives) {
         safeErrorPrint("df: cannot access '");
-        safeErrorPrint(path);
+        safeErrorPrint(path.display);
         safeErrorPrint("': No such file or directory\n");
         all_ok = false;
       }
@@ -1103,7 +1118,8 @@ auto print_disk_usage(const CommandContext<DF_OPTIONS.size()>& ctx)
       std::vector<std::string> row;
       row.reserve(custom_columns.size());
       for (const auto& column : custom_columns) {
-        row.push_back(output_cell(column.field, info, path, *output));
+        row.push_back(
+            output_cell(column.field, info, path.display, *output));
       }
       custom_rows.push_back(std::move(row));
       header_printed = true;

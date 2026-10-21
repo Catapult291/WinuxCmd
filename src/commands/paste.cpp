@@ -201,7 +201,9 @@ auto build_config(const CommandContext<PASTE_OPTIONS.size()>& ctx)
 // Read all lines from a file
 auto paste_input_open_error(std::string_view filename) -> std::string {
   std::error_code ec;
-  auto status = std::filesystem::status(std::filesystem::u8path(filename), ec);
+  auto status = std::filesystem::status(
+      std::filesystem::u8path(native_path::normalize_api_operand(filename)),
+      ec);
   if (!ec && status.type() == std::filesystem::file_type::directory) {
     return std::string("cannot open '") + std::string(filename) +
            "' for reading: Is a directory";

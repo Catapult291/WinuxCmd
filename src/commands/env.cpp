@@ -610,7 +610,7 @@ auto build_environment_block(const std::map<std::string, std::string>& vars)
 auto make_working_directory_arg(const std::string& chdir, std::wstring& storage)
     -> LPCWSTR {
   if (chdir.empty()) return nullptr;
-  storage = utf8_to_wstring(chdir);
+  storage = utf8_to_wstring(native_path::normalize_api_operand(chdir));
   DWORD attrs = GetFileAttributesW(storage.c_str());
   if (attrs == INVALID_FILE_ATTRIBUTES ||
       (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {

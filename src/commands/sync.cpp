@@ -114,7 +114,8 @@ REGISTER_COMMAND(
     }
     for (const auto& exp : expanded) {
       std::error_code path_ec;
-      const std::filesystem::path fs_path = utf8_to_wstring(exp);
+      const std::filesystem::path fs_path =
+          utf8_to_wstring(native_path::normalize_api_operand(exp));
 
       if (sync_fs) {
         if (!std::filesystem::exists(fs_path, path_ec)) {
@@ -133,8 +134,7 @@ REGISTER_COMMAND(
         continue;
       }
 
-      std::wstring wpath = utf8_to_wstring(exp);
-      HANDLE hFile = CreateFileW(wpath.c_str(), GENERIC_WRITE,
+      HANDLE hFile = CreateFileW(fs_path.c_str(), GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
