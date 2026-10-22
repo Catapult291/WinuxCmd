@@ -306,3 +306,47 @@ TEST(csplit, csplit_stdin_ctrlz_not_truncated_issue1212) {
   const std::string joined = tmp.read("part00") + tmp.read("part01");
   EXPECT_TRUE(joined.find("line2") != std::string::npos);
 }
+
+namespace {
+
+// #1276: the MSYS single-letter drive spelling of a native directory
+// ("D:\tmp\x" -> "/d/tmp/x"). The dialect operand must resolve to the
+// named directory regardless of the cwd's drive.
+auto drive_dialect_dir_spelling(const std::filesystem::path& native)
+    -> std::wstring {
+  const std::wstring text = native.wstring();
+  wchar_t drive = text[0];
+  if (drive >= L'A' && drive <= L'Z') {
+    drive = static_cast<wchar_t>(drive - L'A' + L'a');
+  }
+  std::wstring dialect;
+  dialect.push_back(L'/');
+  dialect.push_back(drive);
+  for (size_t i = 2; i < text.size(); ++i) {
+    dialect.push_back(text[i] == L'\\' ? L'/' : text[i]);
+  }
+  return dialect;
+}
+
+}  // namespace
+
+// #1276: a "-f /d/..." dialect prefix must drive segment creation through
+// the resolved spelling. Before the fix the bare ofstream resolved the raw
+// "/d/..." filename against the cwd's drive, so the split files landed on
+// the wrong drive (or failed to open) instead of the named directory.
+TEST(csplit, csplit_prefix_drive_dialect_writes_named_directory) {
+  TempDir tmp;
+  TempDir cwd;
+  cwd.write("test.txt", "aaa\nbbb\nccc\n");
+
+  Pipeline p;
+  p.set_cwd(cwd.wpath());
+  p.add(L"csplit.exe", {L"-f", drive_dialect_dir_spelling(tmp.path) + L"/seg-",
+                        L"test.txt", L"2"});
+  auto r = p.run();
+
+  TEST_LOG_EXIT_CODE(r);
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(tmp.read("seg-00"), "aaa\n");
+  EXPECT_EQ_TEXT(tmp.read("seg-01"), "bbb\nccc\n");
+}
