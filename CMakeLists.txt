@@ -248,6 +248,14 @@ if(ENABLE_UNITY_BUILD)
 
         set(COMMANDS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/commands")
 
+        # The pattern below is built from a literal directory path, so escape
+        # the regex metacharacters the path may contain ("C++Files", "Program
+        # Files (x86)", "..."). Unescaped, "+" after a "+" can never match the
+        # literal directory and every command source silently fails the
+        # commands-dir test, skipping the unity build on those machines.
+        set(COMMANDS_DIR_PATTERN "${COMMANDS_DIR}")
+        string(REGEX REPLACE "([][+.*()^$?|\\\\])" "\\\\\\1" COMMANDS_DIR_PATTERN "${COMMANDS_DIR_PATTERN}")
+
         foreach(SOURCE_FILE ${TARGET_SOURCES})
             if(NOT IS_ABSOLUTE ${SOURCE_FILE})
                 set(ABS_SOURCE_FILE "${CMAKE_CURRENT_SOURCE_DIR}/${SOURCE_FILE}")
@@ -258,7 +266,7 @@ if(ENABLE_UNITY_BUILD)
             get_filename_component(SOURCE_EXT ${ABS_SOURCE_FILE} EXT)
             string(TOLOWER ${SOURCE_EXT} SOURCE_EXT_LOWER)
 
-            if(SOURCE_EXT_LOWER MATCHES "\\.(cpp|cxx|cc)" AND ABS_SOURCE_FILE MATCHES "${COMMANDS_DIR}.*")
+            if(SOURCE_EXT_LOWER MATCHES "\\.(cpp|cxx|cc)" AND ABS_SOURCE_FILE MATCHES "${COMMANDS_DIR_PATTERN}.*")
                 if(EXISTS ${ABS_SOURCE_FILE})
                     list(APPEND UNITY_SOURCE_FILES ${ABS_SOURCE_FILE})
                 endif()
