@@ -458,7 +458,11 @@ class OutputWriter {
     if (!filename_result) {
       return std::unexpected(filename_result.error());
     }
-    std::string filename = *filename_result;
+    // -f/--prefix is an argv operand folded into each derived filename:
+    // normalize once so the ofstream below and cleanup's remove resolve the
+    // same native spelling ("/e/xx-00" -> "E:\xx-00") (#1276).
+    std::string filename =
+        native_path::normalize_api_operand(*filename_result);
 
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
