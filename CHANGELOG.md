@@ -4,7 +4,44 @@ All notable changes to WinuxCmd are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow the
 repository release tags.
 
-## [Unreleased]
+## [1.1.20] - 2026-10-22
+
+### Fixed
+
+- **bare drive-root operands** (`ls /e`, `cp /e ...`, every applet that
+  touches the filesystem outside the shared `native_path` boundary): a bare
+  MSYS drive root (`/e`, `/e/`) bypassed the drive-dialect recognizer and
+  decayed to a cwd-drive-relative path, so resolution depended on the
+  caller's drive. Glob expansion, digest open-failure probes, `mktemp` and
+  the classification probes of head/tail/sort/nl/fmt/fold/comm/join/paste/
+  cut and the *sum family now run on the resolved spelling; `df` keeps the
+  operand spelling for diagnostics. `sort -T` normalizes the dialect hint at
+  temp-dir construction and at chunk cleanup, so spill chunks no longer leak
+  onto the hinted drive root (#1230).
+- **env --file/-f**: the operand was opened with a raw `ifstream`, so MSYS
+  drive-dialect spellings (`/e/...`) decayed to a cwd-relative path and
+  missed the named file. `read_env_file` resolves the operand once through
+  `normalize_api_operand`; the directory-classification probe runs on the
+  native spelling while diagnostics keep the caller's text (#1275).
+- **csplit -f/--prefix**: same family — the output-operand prefix reached
+  `fopen` unfolded, so `/e/prefix-` created `prefix-00` on the cwd drive.
+  The prefix folds through the shared boundary before any creation
+  (#1276).
+- **build**: the unity build matched command sources with
+  `ABS_SOURCE_FILE MATCHES "${COMMANDS_DIR}.*"`, building the regex from a
+  literal path. On checkouts under paths containing regex metacharacters
+  (e.g. `D:\code\C++Files\...`) the pattern cannot compile and configure
+  aborts with "Regular expression ... cannot compile". The metacharacters
+  are escaped before the match (#1281).
+
+### Added
+
+- **`--help` footer**: every applet's `--help` output now ends with the
+  unixwin.dev portal link, so the documentation surface is reachable from
+  the binary itself (#1273). The README and the guides link the portal too
+  (#1271).
+
+## [1.1.19] - 2026-10-21
 
 ### Fixed
 
@@ -217,6 +254,35 @@ repository release tags.
   the write-side follow-up to #1236). The output operand folds once like
   the root operand; the open-failure message keeps quoting the spelling as
   typed.
+
+## [1.1.16] - 2026-10-19
+
+### Fixed
+
+- **mkdir / ln**: POSIX drive-dialect operands (`/e/...`, `/cygdrive/e/...`)
+  reached creation and removal folded onto the cwd drive, so `mkdir /e/d`
+  from a `C:` cwd created `C:\e\d`. Both commands fold operands through the
+  shared boundary before any Win32 call; `ln` also quotes the operand
+  spelling in `-f` removal failures, and `canonicalize_path_w` folds the
+  dialect so `realpath`/`readlink -f` agree (#1231, #1233, #1234).
+
+## [1.1.15] - 2026-10-19
+
+### Added
+
+- **native_path**: `/mnt/X` WSL-interop drive operands resolve like `/e`
+  and `/cygdrive/e` (with a required separator, so `/mnt` itself stays a
+  directory) (#1172). The release archive ships the package shim and maps
+  it; indexing refuses files the archive lacks.
+
+### Fixed
+
+- **echo, text tools, xxd, *sum**: octal `\0nnn` escapes, CRLF CR
+  retention, and `xxd -p` wrapping gained the text-marker treatment
+  (#1203, #1204, #1205).
+- **wpm**: the shim forwarder is delivered and migrated across the wpm
+  lifecycle (#1207), and an update keeps **two** rollback copies
+  (#1206, #1208).
 
 ## [1.1.14] - 2026-10-17
 
