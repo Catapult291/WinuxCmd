@@ -765,11 +765,52 @@ auto is_word_char(unsigned char c) -> bool {
   return std::isalnum(c) || c == '_';
 }
 
+// Word-character test for -w. Mirrors portable_regex: ASCII alnum/_ plus
+// multi-byte UTF-8 codepoints, so CJK is not split into word-breaking bytes.
+auto word_cp_is_word(std::string_view line, size_t pos) -> bool {
+  if (pos >= line.size()) return false;
+  size_t start = pos;
+  auto at = [&](size_t i) {
+    return static_cast<unsigned char>(line[i]);
+  };
+  auto continuation = [](unsigned char c) { return (c & 0xC0) == 0x80; };
+  if (continuation(at(start))) {
+    size_t i = start - 1;
+    size_t scanned = 0;
+    while (i > 0 && scanned < 3 && continuation(at(i))) {
+      --i;
+      ++scanned;
+    }
+    start = i;
+  }
+  const auto lead = at(start);
+  if (lead < 0x80) return is_word_char(lead);
+  // Multi-byte lead with continuation bytes: treat as a word character.
+  size_t need = 0;
+  if ((lead & 0xE0) == 0xC0) {
+    need = 2;
+  } else if ((lead & 0xF0) == 0xE0) {
+    need = 3;
+  } else if ((lead & 0xF8) == 0xF0) {
+    need = 4;
+  } else {
+    return false;
+  }
+  if (start + need > line.size()) return false;
+  for (size_t k = 1; k < need; ++k) {
+    if (!continuation(at(start + k))) return false;
+  }
+  return true;
+}
+
+auto word_cp_is_word_before(std::string_view line, size_t pos) -> bool {
+  if (pos == 0) return false;
+  return word_cp_is_word(line, pos - 1);
+}
+
 auto word_boundary_ok(std::string_view line, size_t begin, size_t end) -> bool {
-  bool left_ok = (begin == 0) ||
-                 !is_word_char(static_cast<unsigned char>(line[begin - 1]));
-  bool right_ok = (end >= line.size()) ||
-                  !is_word_char(static_cast<unsigned char>(line[end]));
+  bool left_ok = !word_cp_is_word_before(line, begin);
+  bool right_ok = !word_cp_is_word(line, end);
   return left_ok && right_ok;
 }
 auto fixed_match_byte(unsigned char ch, bool ignore_case) -> unsigned char {

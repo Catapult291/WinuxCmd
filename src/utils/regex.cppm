@@ -52,6 +52,66 @@ auto is_word_char(unsigned char c) -> bool {
   return std::isalnum(c) || c == '_';
 }
 
+// UTF-8 helpers. The local engine matches on bytes, but `.` and `\b` must
+// advance / inspect whole codepoints so CJK text is not sliced mid-sequence
+// (D7: `grep -o '中.'` used to emit 中 + the next lead byte).
+auto utf8_continuation(unsigned char c) -> bool { return (c & 0xC0) == 0x80; }
+
+auto utf8_char_width_at(std::string_view text, size_t pos) -> size_t {
+  if (pos >= text.size()) return 0;
+  const auto lead = static_cast<unsigned char>(text[pos]);
+  if (lead < 0x80) return 1;
+  size_t need = 0;
+  if ((lead & 0xE0) == 0xC0) {
+    need = 2;
+  } else if ((lead & 0xF0) == 0xE0) {
+    need = 3;
+  } else if ((lead & 0xF8) == 0xF0) {
+    need = 4;
+  } else {
+    return 1;  // invalid lead: treat as a single byte
+  }
+  if (pos + need > text.size()) return 1;
+  for (size_t i = 1; i < need; ++i) {
+    if (!utf8_continuation(static_cast<unsigned char>(text[pos + i]))) {
+      return 1;
+    }
+  }
+  return need;
+}
+
+auto utf8_prev_char_start(std::string_view text, size_t pos) -> size_t {
+  if (pos == 0) return 0;
+  size_t i = pos - 1;
+  size_t scanned = 0;
+  while (i > 0 && scanned < 3 &&
+         utf8_continuation(static_cast<unsigned char>(text[i]))) {
+    --i;
+    ++scanned;
+  }
+  if (i + utf8_char_width_at(text, i) == pos) return i;
+  return pos - 1;
+}
+
+// Word character at a character boundary. Multi-byte codepoints count as
+// word characters (CJK letters under a UTF-8 locale), so `-w` / `\b` treat
+// `中文` as one word rather than three isolated bytes.
+auto is_word_cp_at(std::string_view text, size_t pos) -> bool {
+  if (pos >= text.size()) return false;
+  size_t start = pos;
+  if (utf8_continuation(static_cast<unsigned char>(text[pos]))) {
+    start = utf8_prev_char_start(text, pos);
+  }
+  const auto lead = static_cast<unsigned char>(text[start]);
+  if (lead < 0x80) return is_word_char(lead);
+  return utf8_char_width_at(text, start) > 1;
+}
+
+auto is_word_cp_before(std::string_view text, size_t pos) -> bool {
+  if (pos == 0) return false;
+  return is_word_cp_at(text, utf8_prev_char_start(text, pos));
+}
+
 enum class ClassAtomKind { Literal, Range, Posix };
 
 struct ClassAtom {
@@ -69,6 +129,8 @@ enum class NodeKind {
   AnchorEnd,
   WordStart,
   WordEnd,
+  WordBoundary,
+  WordBoundaryNot,
   CharClass,
   Sequence,
   Alternation,
@@ -391,6 +453,17 @@ class Parser {
       n.kind = NodeKind::WordEnd;
       return add_node(std::move(n));
     }
+    // GNU BRE/ERE extension: \b word boundary, \B not-word-boundary.
+    if (escaped == 'b') {
+      Node n;
+      n.kind = NodeKind::WordBoundary;
+      return add_node(std::move(n));
+    }
+    if (escaped == 'B') {
+      Node n;
+      n.kind = NodeKind::WordBoundaryNot;
+      return add_node(std::move(n));
+    }
     if (escaped >= '1' && escaped <= '9') {
       return make_back_reference(static_cast<size_t>(escaped - '0'));
     }
@@ -574,9 +647,19 @@ class Pattern {
     if (engine_ == Engine::Pcre2) return pcre2_find(text, start, false);
 #endif
 
-    for (size_t cursor = start; cursor <= text.size(); ++cursor) {
+    for (size_t cursor = start; cursor <= text.size();) {
       auto states = match_node(root_, text, make_initial_state(cursor));
-      if (states.empty()) continue;
+      if (states.empty()) {
+        ++cursor;
+        // Do not restart mid-codepoint: a continuation byte is never a
+        // character boundary, so trying it would let `.` slice UTF-8.
+        while (cursor < text.size() &&
+               detail::utf8_continuation(
+                   static_cast<unsigned char>(text[cursor]))) {
+          ++cursor;
+        }
+        continue;
+      }
 
       auto best = std::max_element(
           states.begin(), states.end(),
@@ -761,9 +844,11 @@ class Pattern {
         }
         return {};
       case detail::NodeKind::Dot:
+        // Consume a whole UTF-8 codepoint when the sequence is well-formed
+        // so `.` cannot split a multi-byte character (D7).
         if (state.pos < text.size()) {
           State next = state;
-          ++next.pos;
+          next.pos += detail::utf8_char_width_at(text, state.pos);
           return {std::move(next)};
         }
         return {};
@@ -774,26 +859,25 @@ class Pattern {
         return state.pos == text.size() ? std::vector<State>{state}
                                         : std::vector<State>{};
       case detail::NodeKind::WordStart:
-        if (state.pos >= text.size()) return {};
-        if (!detail::is_word_char(
-                static_cast<unsigned char>(text[state.pos]))) {
-          return {};
-        }
-        if (state.pos > 0 && detail::is_word_char(static_cast<unsigned char>(
-                                 text[state.pos - 1]))) {
-          return {};
-        }
+        if (!detail::is_word_cp_at(text, state.pos)) return {};
+        if (detail::is_word_cp_before(text, state.pos)) return {};
         return {state};
       case detail::NodeKind::WordEnd:
-        if (state.pos == 0 || !detail::is_word_char(static_cast<unsigned char>(
-                                  text[state.pos - 1]))) {
-          return {};
-        }
-        if (state.pos < text.size() &&
-            detail::is_word_char(static_cast<unsigned char>(text[state.pos]))) {
-          return {};
-        }
+        if (!detail::is_word_cp_before(text, state.pos)) return {};
+        if (detail::is_word_cp_at(text, state.pos)) return {};
         return {state};
+      case detail::NodeKind::WordBoundary:
+        if (detail::is_word_cp_before(text, state.pos) !=
+            detail::is_word_cp_at(text, state.pos)) {
+          return {state};
+        }
+        return {};
+      case detail::NodeKind::WordBoundaryNot:
+        if (detail::is_word_cp_before(text, state.pos) ==
+            detail::is_word_cp_at(text, state.pos)) {
+          return {state};
+        }
+        return {};
       case detail::NodeKind::CharClass:
         if (state.pos < text.size() && class_matches(node, text[state.pos])) {
           State next = state;
