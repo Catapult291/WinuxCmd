@@ -2093,15 +2093,74 @@ auto depth_from_root(const std::filesystem::path& root,
 // path::string()/generic_string() convert through the system ACP (e.g. GBK
 // on zh-CN installs), so non-ASCII filenames leak as ACP bytes instead of
 // UTF-8, both in printed output and in -name/-path pattern matching.
+auto strip_extended_display_w(std::wstring_view path) -> std::wstring {
+  if (path.size() >= 8 && path.compare(0, 8, L"\\\\?\\UNC\\") == 0) {
+    return L"\\\\" + std::wstring(path.substr(8));
+  }
+  if (path.size() >= 4 && path.compare(0, 4, L"\\\\?\\") == 0) {
+    return std::wstring(path.substr(4));
+  }
+  return std::wstring(path);
+}
+
 auto path_to_utf8(const std::filesystem::path& p) -> std::string {
-  return wstring_to_utf8(p.generic_wstring());
+  auto s = strip_extended_display_w(p.wstring());
+  std::replace(s.begin(), s.end(), L'\\', L'/');
+  return wstring_to_utf8(s);
 }
 
 auto path_display(const std::filesystem::path& p) -> std::string {
   auto s = path_to_utf8(p);
   if (s.empty()) return ".";
-  std::replace(s.begin(), s.end(), '\\', '/');
   return s;
+}
+
+// Probe/iterate through the extended-length API boundary so roots and
+// descendants past MAX_PATH are not reported as missing (D9). std::filesystem
+// without \\?\ fails GetFileAttributes with ERROR_PATH_NOT_FOUND even when the
+// directory exists.
+auto to_io_path(const std::filesystem::path& p) -> std::filesystem::path {
+  return std::filesystem::path(native_path::to_extended_path(p.wstring()));
+}
+
+// Map an extended-path iterator entry back onto the command-line spelling so
+// relative starting points keep relative printed names and -path patterns.
+auto logical_from_io(const std::filesystem::path& logical_root,
+                     const std::filesystem::path& io_root,
+                     const std::filesystem::path& io_path)
+    -> std::filesystem::path {
+  const std::wstring io_root_s = io_root.wstring();
+  const std::wstring io_path_s = io_path.wstring();
+  if (io_path_s.size() <= io_root_s.size() ||
+      _wcsnicmp(io_path_s.c_str(), io_root_s.c_str(), io_root_s.size()) != 0) {
+    return std::filesystem::path(strip_extended_display_w(io_path_s));
+  }
+  std::wstring rel = io_path_s.substr(io_root_s.size());
+  while (!rel.empty() && (rel[0] == L'\\' || rel[0] == L'/')) {
+    rel.erase(rel.begin());
+  }
+  if (rel.empty()) return logical_root;
+  return logical_root / std::filesystem::path(std::move(rel));
+}
+
+auto root_probe_error_text(DWORD error) -> std::string {
+  if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
+    return "Permission denied";
+  }
+  return win32_posix_error_text(error);
+}
+
+auto report_root_probe_failure(const std::filesystem::path& root) -> void {
+  const DWORD error = GetLastError();
+  safeErrorPrint("find: '");
+  safeErrorPrint(path_display(root));
+  safeErrorPrint("': ");
+  safeErrorPrint(root_probe_error_text(error));
+  safeErrorPrint("\n");
+}
+
+auto root_exists(const std::filesystem::path& root) -> bool {
+  return native_path::exists_w(root.wstring());
 }
 
 auto is_empty_entry(const std::filesystem::directory_entry& e) -> bool {
@@ -3855,7 +3914,8 @@ auto apply_actions(const std::filesystem::path& p,
 // volume but not same-volume mount nuances.
 auto volume_root_key(const std::filesystem::path& p) -> std::wstring {
   wchar_t root[MAX_PATH];
-  if (GetVolumePathNameW(p.wstring().c_str(), root, MAX_PATH)) {
+  const auto wide = native_path::to_extended_path(p.wstring());
+  if (GetVolumePathNameW(wide.c_str(), root, MAX_PATH)) {
     return root;
   }
   return {};
@@ -3889,8 +3949,9 @@ auto should_descend_into(const std::filesystem::directory_entry& e,
 auto scan_depth_first(const std::filesystem::path& root,
                       const std::filesystem::path& p, int depth, Config& cfg,
                       bool& matched_any) -> void {
+  const auto io_p = to_io_path(p);
   std::error_code ec;
-  std::filesystem::directory_entry entry(p, ec);
+  std::filesystem::directory_entry entry(io_p, ec);
   if (ec) {
     safeErrorPrint("find: '");
     safeErrorPrint(path_display(p));
@@ -3907,13 +3968,13 @@ auto scan_depth_first(const std::filesystem::path& root,
       options |= std::filesystem::directory_options::follow_directory_symlink;
     }
 
-    std::filesystem::directory_iterator it(p, options, ec);
+    std::filesystem::directory_iterator it(io_p, options, ec);
     std::filesystem::directory_iterator end;
     if (ec) {
       safeErrorPrint("find: '");
       safeErrorPrint(path_display(p));
       safeErrorPrint("': ");
-      safeErrorPrint(ec.message());
+      safeErrorPrint(root_probe_error_text(ec.value()));
       safeErrorPrint("\n");
       cfg.had_error = true;
     } else {
@@ -3922,12 +3983,13 @@ auto scan_depth_first(const std::filesystem::path& root,
           safeErrorPrint("find: '");
           safeErrorPrint(path_display(p));
           safeErrorPrint("': ");
-          safeErrorPrint(ec.message());
+          safeErrorPrint(root_probe_error_text(ec.value()));
           safeErrorPrint("\n");
           cfg.had_error = true;
           break;
         }
-        scan_depth_first(root, it->path(), depth + 1, cfg, matched_any);
+        auto child = logical_from_io(p, io_p, it->path());
+        scan_depth_first(root, child, depth + 1, cfg, matched_any);
       }
     }
   }
@@ -3945,8 +4007,9 @@ auto scan_depth_first(const std::filesystem::path& root,
 auto scan_delete_depth_first(const std::filesystem::path& root,
                              const std::filesystem::path& p, int depth,
                              Config& cfg, bool& matched_any) -> void {
+  const auto io_p = to_io_path(p);
   std::error_code ec;
-  std::filesystem::directory_entry entry(p, ec);
+  std::filesystem::directory_entry entry(io_p, ec);
   if (ec) {
     safeErrorPrint("find: '");
     safeErrorPrint(path_display(p));
@@ -3963,13 +4026,13 @@ auto scan_delete_depth_first(const std::filesystem::path& root,
       options |= std::filesystem::directory_options::follow_directory_symlink;
     }
 
-    std::filesystem::directory_iterator it(p, options, ec);
+    std::filesystem::directory_iterator it(io_p, options, ec);
     std::filesystem::directory_iterator end;
     if (ec) {
       safeErrorPrint("find: '");
       safeErrorPrint(path_display(p));
       safeErrorPrint("': ");
-      safeErrorPrint(ec.message());
+      safeErrorPrint(root_probe_error_text(ec.value()));
       safeErrorPrint("\n");
       cfg.had_error = true;
     } else {
@@ -3978,12 +4041,13 @@ auto scan_delete_depth_first(const std::filesystem::path& root,
           safeErrorPrint("find: '");
           safeErrorPrint(path_display(p));
           safeErrorPrint("': ");
-          safeErrorPrint(ec.message());
+          safeErrorPrint(root_probe_error_text(ec.value()));
           safeErrorPrint("\n");
           cfg.had_error = true;
           break;
         }
-        scan_delete_depth_first(root, it->path(), depth + 1, cfg, matched_any);
+        auto child = logical_from_io(p, io_p, it->path());
+        scan_delete_depth_first(root, child, depth + 1, cfg, matched_any);
       }
     }
   }
@@ -4000,17 +4064,15 @@ auto scan_delete_depth_first(const std::filesystem::path& root,
 
 auto scan_one_root(const std::filesystem::path& root, Config& cfg,
                    bool& matched_any) -> void {
-  std::error_code ec;
-  bool exists = std::filesystem::exists(root, ec);
-  if (ec || !exists) {
-    safeErrorPrint("find: '");
-    safeErrorPrint(path_display(root));
-    safeErrorPrint("': No such file or directory\n");
+  if (!root_exists(root)) {
+    report_root_probe_failure(root);
     cfg.had_error = true;
     return;
   }
 
-  std::filesystem::directory_entry root_entry(root, ec);
+  const auto io_root = to_io_path(root);
+  std::error_code ec;
+  std::filesystem::directory_entry root_entry(io_root, ec);
   if (!ec) {
     int d = 0;
     bool matched = entry_matches(cfg, root, root_entry, d, root);
@@ -4029,17 +4091,22 @@ auto scan_one_root(const std::filesystem::path& root, Config& cfg,
     }
   }
 
-  if (!std::filesystem::is_directory(root, ec) || ec) return;
+  if (!native_path::is_directory_w(io_root.wstring())) return;
 
   auto options = std::filesystem::directory_options::skip_permission_denied;
   if (cfg.follow_symlinks) {
     options |= std::filesystem::directory_options::follow_directory_symlink;
   }
 
-  std::filesystem::recursive_directory_iterator it(root, options, ec);
+  std::filesystem::recursive_directory_iterator it(io_root, options, ec);
   std::filesystem::recursive_directory_iterator end;
 
   if (ec) {
+    safeErrorPrint("find: '");
+    safeErrorPrint(path_display(root));
+    safeErrorPrint("': ");
+    safeErrorPrint(root_probe_error_text(ec.value()));
+    safeErrorPrint("\n");
     cfg.had_error = true;
     return;
   }
@@ -4047,7 +4114,7 @@ auto scan_one_root(const std::filesystem::path& root, Config& cfg,
   for (; it != end; ++it) {
     std::error_code iec;
     const auto& de = *it;
-    auto p = de.path();
+    auto p = logical_from_io(root, io_root, de.path());
     int d = static_cast<int>(it.depth()) + 1;
 
     if (d > cfg.maxdepth) {
@@ -4077,23 +4144,15 @@ auto process(Config& cfg) -> int {
     // [GNU] -xdev: the volume of the starting point anchors the traversal.
     cfg.xdev_volume_key = volume_root_key(root);
     if (cfg.delete_action) {
-      std::error_code ec;
-      bool exists = std::filesystem::exists(root, ec);
-      if (ec || !exists) {
-        safeErrorPrint("find: '");
-        safeErrorPrint(path_display(root));
-        safeErrorPrint("': No such file or directory\n");
+      if (!root_exists(root)) {
+        report_root_probe_failure(root);
         cfg.had_error = true;
       } else {
         scan_delete_depth_first(root, root, 0, cfg, matched_any);
       }
     } else if (cfg.depth_first) {
-      std::error_code ec;
-      bool exists = std::filesystem::exists(root, ec);
-      if (ec || !exists) {
-        safeErrorPrint("find: '");
-        safeErrorPrint(path_display(root));
-        safeErrorPrint("': No such file or directory\n");
+      if (!root_exists(root)) {
+        report_root_probe_failure(root);
         cfg.had_error = true;
       } else {
         scan_depth_first(root, root, 0, cfg, matched_any);
