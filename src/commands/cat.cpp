@@ -258,6 +258,33 @@ REGISTER_COMMAND(cat, "cat",
                             CatState &state) {
     if (fast_passthrough) {
       std::array<char, 8192> buffer{};
+      // niubash D4: istream::read loops until the buffer is FULL (or EOF),
+      // so `producer | cat` withholds a dribbling producer's output inside
+      // cat until the producer exits — GNU cat emits whatever read(2)
+      // delivers per call. On a pipe/console stdin a single ReadFile short-
+      // reads (any available bytes), so each chunk reaches safePrint as it
+      // arrives; disk inputs keep the fill loop — the data is always
+      // available there and the large read stays the fast path. Only the
+      // real stdin stream takes this arm (a file operand keeps its
+      // ifstream even when the process stdin happens to be a pipe).
+      HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+      DWORD inType =
+          (hIn == INVALID_HANDLE_VALUE || hIn == nullptr)
+              ? 0
+              : GetFileType(hIn);
+      if (&stream == &std::cin &&
+          (inType == FILE_TYPE_PIPE || inType == FILE_TYPE_CHAR)) {
+        while (!is_stdout_pipe_closed()) {
+          DWORD got = 0;
+          if (!ReadFile(hIn, buffer.data(),
+                        static_cast<DWORD>(buffer.size()), &got, nullptr)) {
+            break;  // EOF (broken pipe) or read error
+          }
+          if (got == 0) break;
+          safePrint(std::string_view(buffer.data(), got));
+        }
+        return;
+      }
       while (stream.good()) {
         stream.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         auto got = stream.gcount();
