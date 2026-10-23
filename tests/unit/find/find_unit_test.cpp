@@ -2250,6 +2250,79 @@ TEST(find, find_delete_missing_root_diagnostic_uses_generic_slashes) {
       std::string::npos);
 }
 
+// D9: a start point longer than MAX_PATH must not be reported as missing when
+// the directory exists. std::filesystem::exists without \\?\ fails with
+// ERROR_PATH_NOT_FOUND; the root probe goes through native_path instead.
+TEST(find, find_long_root_beyond_max_path_is_not_reported_missing) {
+  TempDir tmp;
+
+  std::wstring deep = tmp.wpath();
+  const std::wstring component(40, L'x');
+  for (int i = 0; i < 8; ++i) {
+    deep += L"\\" + component;
+  }
+  if (deep.size() <= MAX_PATH) {
+    std::cout << "  SKIPPED (path not longer than MAX_PATH: " << deep.size()
+              << ")\n";
+    return;
+  }
+
+  // Create through the extended-length API; std::filesystem::create_directories
+  // without \\?\ rejects paths past MAX_PATH.
+  std::wstring cursor = tmp.wpath();
+  for (int i = 0; i < 8; ++i) {
+    cursor += L"\\" + component;
+    const std::wstring extended =
+        cursor.rfind(L"\\\\?\\", 0) == 0 ? cursor : L"\\\\?\\" + cursor;
+    if (!CreateDirectoryW(extended.c_str(), nullptr)) {
+      const DWORD err = GetLastError();
+      if (err != ERROR_ALREADY_EXISTS) {
+        std::cout << "  SKIPPED (CreateDirectoryW failed with error " << err
+                  << ")\n";
+        return;
+      }
+    }
+  }
+  temp_dir_detail::write_all(std::filesystem::path(deep) / L"d9.txt", "x", 1);
+
+  const std::wstring root_display = deep;  // no \\?\ prefix
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"find.exe", {root_display, L"-maxdepth", L"0", L"-type", L"d"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_TRUE(r.stderr_text.find("No such file") == std::string::npos);
+  EXPECT_FALSE(r.stdout_text.empty());
+
+  Pipeline p2;
+  p2.set_cwd(tmp.wpath());
+  p2.add(L"find.exe", {root_display, L"-name", L"d9.txt"});
+  auto r2 = p2.run();
+  EXPECT_EQ(r2.exit_code, 0);
+  EXPECT_TRUE(r2.stderr_text.find("No such file") == std::string::npos);
+  EXPECT_TRUE(r2.stdout_text.find("d9.txt") != std::string::npos);
+}
+
+// D9: still report a true missing start point as ENOENT, not a different
+// message, after switching the probe off std::filesystem::exists.
+TEST(find, find_missing_root_still_reports_enoent_after_native_probe) {
+  TempDir tmp;
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"find.exe", {L"no-such-start-point", L"-maxdepth", L"0"});
+
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 1);
+  EXPECT_TRUE(
+      r.stderr_text.find("find: 'no-such-start-point': No such file or "
+                         "directory") !=
+      std::string::npos);
+}
+
 TEST(find, find_prune_skips_descending_into_directories) {
   TempDir tmp;
   std::filesystem::create_directories(tmp.path / "keep" / "nested");
