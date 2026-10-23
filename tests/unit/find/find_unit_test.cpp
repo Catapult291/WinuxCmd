@@ -2256,7 +2256,7 @@ TEST(find, find_delete_missing_root_diagnostic_uses_generic_slashes) {
 TEST(find, find_long_root_beyond_max_path_is_not_reported_missing) {
   TempDir tmp;
 
-  std::wstring deep = tmp.wpath().wstring();
+  std::wstring deep = tmp.wpath();
   const std::wstring component(40, L'x');
   for (int i = 0; i < 8; ++i) {
     deep += L"\\" + component;
@@ -2269,7 +2269,7 @@ TEST(find, find_long_root_beyond_max_path_is_not_reported_missing) {
 
   // Create through the extended-length API; std::filesystem::create_directories
   // without \\?\ rejects paths past MAX_PATH.
-  std::wstring cursor = tmp.wpath().wstring();
+  std::wstring cursor = tmp.wpath();
   for (int i = 0; i < 8; ++i) {
     cursor += L"\\" + component;
     const std::wstring extended =
