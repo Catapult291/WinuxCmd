@@ -661,6 +661,85 @@ TEST(grep, grep_gnu_word_boundary_tokens) {
   EXPECT_EQ_TEXT(r.stdout_text, "foo\nbar foo baz\n");
 }
 
+// D7: GNU \b is a word boundary in BRE/ERE; the local engine used to parse
+// it as a literal 'b', so `\balpha\b` never matched "alpha".
+TEST(grep, grep_gnu_backslash_b_word_boundary) {
+  TempDir tmp;
+  tmp.write("a.txt", "alpha beta\nbalphab\nalphabet\n");
+
+  Pipeline basic;
+  basic.set_cwd(tmp.wpath());
+  basic.add(L"grep.exe", {L"\\balpha\\b", L"a.txt"});
+  auto basic_result = basic.run();
+
+  EXPECT_EQ(basic_result.exit_code, 0);
+  EXPECT_EQ_TEXT(basic_result.stdout_text, "alpha beta\n");
+
+  Pipeline extended;
+  extended.set_cwd(tmp.wpath());
+  extended.add(L"grep.exe", {L"-E", L"\\balpha\\b", L"a.txt"});
+  auto extended_result = extended.run();
+
+  EXPECT_EQ(extended_result.exit_code, 0);
+  EXPECT_EQ_TEXT(extended_result.stdout_text, "alpha beta\n");
+}
+
+TEST(grep, grep_backslash_B_is_not_word_boundary) {
+  TempDir tmp;
+  tmp.write("a.txt", "alphabet\nalpha beta\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"grep.exe", {L"\\balpha\\B", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "alphabet\n");
+}
+
+// D7: `.` must consume a whole UTF-8 codepoint. Before the fix,
+// `grep -o '中.'` emitted the first three bytes of 中 plus one byte of 文.
+TEST(grep, grep_dot_only_matches_whole_utf8_codepoints) {
+  TempDir tmp;
+  tmp.write("a.txt", "中文测试\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"grep.exe", {L"-o", L"中.", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "中文\n");
+}
+
+TEST(grep, grep_only_matching_dot_walks_utf8_codepoints) {
+  TempDir tmp;
+  tmp.write("a.txt", "中文\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"grep.exe", {L"-o", L".", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "中\n文\n");
+}
+
+// -w on multi-byte text: the match must sit on whole codepoints, and a
+// multi-byte neighbor still counts as a word character (like GNU UTF-8).
+TEST(grep, grep_word_regexp_respects_utf8_codepoints) {
+  TempDir tmp;
+  tmp.write("a.txt", "中文\nx中文\n中文x\n");
+
+  Pipeline p;
+  p.set_cwd(tmp.wpath());
+  p.add(L"grep.exe", {L"-w", L"中文", L"a.txt"});
+  auto r = p.run();
+
+  EXPECT_EQ(r.exit_code, 0);
+  EXPECT_EQ_TEXT(r.stdout_text, "中文\n");
+}
+
 TEST(grep, grep_basic_escaped_alternation_matches_gnu_extension) {
   TempDir tmp;
   tmp.write("a.txt", "zero\nrecord\nother\n");
